@@ -1,8 +1,8 @@
-# DDOS-Attack 分布式拒绝服务攻击模拟工具
+# DDoS-Attack 分布式拒绝服务攻击模拟工具
 
 ## 严格的法律与道德警告
 
-- 本项目仅用于教育目的！ 它旨在帮助安全研究人员、网络管理员和学生理解 DDOS 攻击的原理，以便更好地设计防御策略。
+- 本项目仅用于教育目的！ 它旨在帮助安全研究人员、网络管理员和学生理解 DDoS 攻击的原理，以便更好地设计防御策略。
 - 未经授权对任何非你个人拥有的服务器、网络或设备发起攻击是严重的犯罪行为，将受到法律严惩。
 - 请确保你只在拥有完全控制权的隔离实验环境（例如本地虚拟机、自建测试网络）中运行此代码。 作者对任何不当使用不承担任何责任。
 
@@ -10,7 +10,7 @@
 
 ## 项目简介
 
-DDOS-Attack 是一个跨平台的高性能 DDOS 模拟工具，支持 Python、Java 和 C语言 三种实现版本，能够向指定 IP 和端口发送 UDP 洪水数据包。所有版本均采用高性能优化设计，支持多线程/多进程、批量发送、随机端口等特性。
+「 DDoS-Attack_t3g85hxb670 」 是一个跨平台的高性能 DDoS 模拟工具，支持 Python、Java 和 C语言 三种实现版本，能够向指定 IP 和端口发送 UDP 洪水数据包。所有版本均采用高性能优化设计，支持多线程/多进程、批量发送、随机端口等特性。
 
 ---
 
@@ -30,7 +30,7 @@ DDOS-Attack 是一个跨平台的高性能 DDOS 模拟工具，支持 Python、J
 
 ### Python 版特性
 
-- 跨平台支持（Windows/Linux/macOS/Android Termux）
+- 跨平台支持（Windows/Linux/macOS/Android_Termux）
 - 多线程发送
 - 跨平台清屏函数
 
@@ -85,7 +85,7 @@ DDOS-Attack/
 │   ├── Figlet_DDOS-Attack           → figlet 字体预览（DDOS-Attack）
 │   └── Figlet_AttackStarting        → figlet 字体预览（Attack Starting）
 ├── README.md                        → 中文介绍
-├── LICENSE                          → 开源许可（GPLv3）
+└── LICENSE                          → 开源许可（GPLv3）
 ```
 
 ---
