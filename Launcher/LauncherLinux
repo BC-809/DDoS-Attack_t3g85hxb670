@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 set -Eeuo pipefail
 
 RED=$'\033[0;31m'
@@ -19,7 +21,6 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# ---------- 发行版检测 ----------
 detect_distro() {
   if [[ -f /etc/os-release ]]; then
     . /etc/os-release
@@ -37,33 +38,15 @@ detect_distro() {
   log "检测到发行版族: $PKG_FAMILY (ID=$DISTRO_ID)"
 }
 
-# ---------- 检测函数 ----------
 have_cmd() { command -v "$1" &>/dev/null; }
 
-# C 工具链是否完整
-c_ready() {
-  have_cmd gcc && have_cmd make
-}
+c_ready()      { have_cmd gcc && have_cmd make; }
+java_ready()   { have_cmd java && have_cmd javac; }
+python_ready() { have_cmd python3 && have_cmd pip3; }
+figlet_ready() { have_cmd figlet; }
 
-# Java 是否完整（编译 + 运行）
-java_ready() {
-  have_cmd java && have_cmd javac
-}
-
-# Python 是否完整（解释器 + pip）
-python_ready() {
-  have_cmd python3 && have_cmd pip3
-}
-
-# figlet
-figlet_ready() {
-  have_cmd figlet
-}
-
-# ---------- 主流程 ----------
 detect_distro
 
-# 第一轮：全量检测，构建待安装列表
 log "===== 阶段 1：检测已安装组件（不下载） ====="
 MISSING=()
 NEED_EPEL=0
@@ -97,7 +80,6 @@ else
   [[ "$PKG_FAMILY" == "rhel" ]] && NEED_EPEL=1
 fi
 
-# 全部已安装：直接退出，零下载
 if [[ ${#MISSING[@]} -eq 0 ]]; then
   echo
   ok "所有目标组件均已安装，无需下载任何内容。"
@@ -108,7 +90,6 @@ fi
 
 log "待安装项：${MISSING[*]}"
 
-# 第二轮：仅在存在缺失时，才更新索引 + 安装
 log "===== 阶段 2：安装缺失组件 ====="
 
 pkg_update() {
@@ -130,7 +111,6 @@ pkg_install() {
   fi
 }
 
-# 按需安装：只对缺失项调用 pkg_install
 install_item() {
   local item="$1"
   case "$item" in
@@ -174,7 +154,6 @@ for item in "${MISSING[@]}"; do
   install_item "$item"
 done
 
-# ---------- 汇总验证 ----------
 echo
 echo -e "${GREEN}================ 安装汇总 ================${NC}"
 printf "  %-12s : %s\n" "gcc"    "$(gcc --version 2>/dev/null | head -1 || echo '未安装')"
