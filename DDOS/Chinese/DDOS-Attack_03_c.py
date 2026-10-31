@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-DDOS-Attack - UDP Flood Attack Tool (命令行版)
-仅供授权隔离环境内的教学/研究使用
-
-用法示例:
-  python DDOS-Attack.py -t 192.168.1.100 -p 53 -g 1
-  python DDOS-Attack.py -t 10.0.0.1 -p 80 -g 5 --random-port -d 30
-  sudo python DDOS-Attack.py -t 10.0.0.1 -p 53 -g 1 --spoof 1.2.3.4 --frag
-"""
-
 import sys
 import os
 import time
