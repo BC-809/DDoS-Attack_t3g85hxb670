@@ -40,9 +40,9 @@ print(r"| |_| | |_| | |_| |___) |_____/ ___ \ |_| || (_| | (__|   <  ")
 print(r"|____/|____/ \___/|____/     /_/   \_\__|\__\__,_|\___|_|\_\ ")
 print("Author  : Su-StackTrace")
 print("GitHub  : https://github.com/BC-809/DDoS-Attack_t3g85hxb670.git")
-print("")
+print("==================================================")
 print("Minecraft Java Edition Bot Attack Module")
-print("")
+print("==================================================")
 
 # ==================== Parameter Input ====================
 
