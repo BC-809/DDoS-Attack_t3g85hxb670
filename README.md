@@ -70,6 +70,7 @@ DDOS-Attack/
 │   │   ├── DDOS-Attack_01_c.py      → 攻击代码文件（完整版），中文
 │   │   ├── DDOS-Attack_02_c.py      → 快捷版（省去艺术字体加载），中文
 │   │   ├── DDOS-Attack_03_c.py      → 可伪造源 IP 版本（需 ROOT 权限），中文
+│   │   ├── DDOS-Attack_04_c.py      → Minecraft_Java 假人攻击，中文
 │   │   ├── DDOS-Attack_05_c.c       → C 语言版本，仅适用于 Windows ，中文
 │   │   ├── DDOS-Attack_06_c.java    → Java 版本，中文
 │   │   └── DDOS-Attack_07_c.c       → C 语言版本，仅适用于 Linux ，中文
@@ -77,9 +78,13 @@ DDOS-Attack/
 │        ├── DDOS-Attack_01_e.py      → 攻击代码文件（完整版），英文
 │        ├── DDOS-Attack_02_e.py      → 快捷版（省去艺术字体加载），英文
 │        └── DDOS-Attack_03_e.py      → 可伪造源 IP 版本（需 ROOT 权限），英文
+│        ├── DDOS-Attack_04_e.py      → Minecraft_Java 假人攻击，英文
+│        ├── DDOS-Attack_05_e.c       → C 语言版本，仅适用于 Windows ，英文
+│        ├── DDOS-Attack_06_e.java    → Java 版本，英文
+│        └── DDOS-Attack_07_e.c       → C 语言版本，仅适用于 Linux ，英文
 ├── Launcher/
-│   ├── LauncherWindows.bat          → Windows 运行文件（自动安装依赖）
-│   └── LauncherLinux                → Linux 运行文件（自动安装依赖）
+│   ├── LauncherWindows.bat          → Windows 运行文件（自动安装依赖，并选择文件运行）
+│   └── LauncherLinux                → Linux 运行文件（自动安装依赖，并选择文件运行）
 ├── Art/
 │   ├── Figlet_DDOS-Attack           → figlet 字体预览（DDOS-Attack）
 │   └── Figlet_AttackStarting        → figlet 字体预览（Attack Starting）
