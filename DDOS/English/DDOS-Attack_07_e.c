@@ -90,9 +90,10 @@ static void show_banner(void) {
     printf("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM   Sucodesu\n");
     printf("\n");
     
-    printf("======================= WARNING ========================\n");
-    printf("You are crossing the legal and ethical boundary. Please exit immediately, or wait 3 seconds to start.\n");
-    printf("========================================================\n");
+    printf("========================= WARNING ==========================\n");
+    printf("You are crossing the legal and ethical boundary. \n");
+    printf("Please exit immediately, or wait 3 seconds to start.\n");
+    printf("============================================================\n");
     sleep(1);
     for (int i = 3; i > 0; i--) {
         printf("%d\n", i);
