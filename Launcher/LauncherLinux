@@ -13,16 +13,16 @@ ok()   { echo -e "${GREEN}[ OK ]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()  { echo -e "${RED}[ERR ]${NC} $*" >&2; }
 
-trap 'err "脚本在第 $LINENO 行出错，退出。"; exit 1' ERR
+trap 'err "Script failed at line $LINENO, exiting."; exit 1' ERR
 export DEBIAN_FRONTEND=noninteractive
 
 if [[ $EUID -ne 0 ]]; then
-  err "请使用 root 或 sudo 运行此脚本。"
+  err "Please run this script as root or with sudo."
   exit 1
 fi
 
 # ============================================================
-# 原有：发行版检测
+# Existing: distro detection
 # ============================================================
 detect_distro() {
   if [[ -f /etc/os-release ]]; then
@@ -30,15 +30,15 @@ detect_distro() {
     DISTRO_ID="${ID:-unknown}"
     DISTRO_LIKE="${ID_LIKE:-}"
   else
-    err "无法找到 /etc/os-release，不支持的 Linux 发行版。"
+    err "Cannot find /etc/os-release, unsupported Linux distribution."
     exit 1
   fi
   case "$DISTRO_ID $DISTRO_LIKE" in
     *debian*|*ubuntu*) PKG_FAMILY="debian" ;;
     *rhel*|*fedora*|*centos*) PKG_FAMILY="rhel" ;;
-    *) err "暂不支持该发行版: ID=$DISTRO_ID, ID_LIKE=$DISTRO_LIKE"; exit 1 ;;
+    *) err "Unsupported distribution: ID=$DISTRO_ID, ID_LIKE=$DISTRO_LIKE"; exit 1 ;;
   esac
-  log "检测到发行版族: $PKG_FAMILY (ID=$DISTRO_ID)"
+  log "Detected distro family: $PKG_FAMILY (ID=$DISTRO_ID)"
 }
 
 have_cmd() { command -v "$1" &>/dev/null; }
@@ -49,7 +49,7 @@ python_ready() { have_cmd python3 && have_cmd pip3; }
 figlet_ready() { have_cmd figlet; }
 
 # ============================================================
-# 新增：项目根目录定位（从当前目录向上找含 DDOS/ 的目录）
+# New: resolve project root (walk up to find DDOS/)
 # ============================================================
 resolve_project_root() {
   local start="${1:-$(pwd)}"
@@ -72,7 +72,7 @@ resolve_project_root() {
 }
 
 # ============================================================
-# 新增：按文件类型执行
+# New: execute selected file
 # ============================================================
 run_target_file() {
   local path="$1"
@@ -80,24 +80,24 @@ run_target_file() {
   local ext="${name##*.}"
   ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
 
-  log "准备运行：$path"
+  log "Preparing to run: $path"
 
   case "$ext" in
     py)
       if ! have_cmd python3; then
-        err "未找到 python3，无法运行。"
+        err "python3 not found, cannot run."
         return 1
       fi
-      ok "执行: python3 \"$path\""
+      ok "Executing: python3 \"$path\""
       python3 "$path"
       ;;
 
     java)
       if ! have_cmd javac || ! have_cmd java; then
-        err "未找到 javac/java，无法运行。"
+        err "javac/java not found, cannot run."
         return 1
       fi
-      # 从源码提取 public class 名
+      # Extract public class name from source
       local class_name
       class_name="$(grep -oE '^[[:space:]]*public[[:space:]]+(final[[:space:]]+)?class[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$path" \
                     | head -1 \
@@ -108,19 +108,19 @@ run_target_file() {
       local workdir
       workdir="$(dirname "$path")"
       pushd "$workdir" >/dev/null
-      ok "编译: javac \"$path\""
+      ok "Compiling: javac \"$path\""
       if ! javac "$path"; then
-        err "javac 编译失败。"
+        err "javac compilation failed."
         popd >/dev/null
         return 1
       fi
-      ok "执行: java $class_name"
+      ok "Executing: java $class_name"
       java "$class_name"
       popd >/dev/null
       ;;
 
     c)
-      # 判断是 Windows 版还是 Linux 版 C 代码
+      # Detect Windows vs Linux C source
       local is_windows_c=0
       local is_linux_c=0
       if grep -qE '#include[[:space:]]*[<"][[:space:]]*(windows\.h|winsock2\.h)' "$path"; then
@@ -131,13 +131,13 @@ run_target_file() {
       fi
 
       if [[ $is_windows_c -eq 1 && $is_linux_c -eq 0 ]]; then
-        warn "该文件看起来是 Windows 专用 C 代码，Linux 下无法直接编译运行。"
-        log "请在 Windows 下使用 LauncherWindows 运行，或在 MinGW 环境中编译。"
+        warn "This file appears to be Windows-only C code and cannot be compiled directly on Linux."
+        log "Run it on Windows with LauncherWindows, or compile it under MinGW."
         return 1
       fi
 
       if ! have_cmd gcc; then
-        err "未找到 gcc，无法编译。"
+        err "gcc not found, cannot compile."
         return 1
       fi
 
@@ -147,34 +147,34 @@ run_target_file() {
       workdir="$(dirname "$path")"
       pushd "$workdir" >/dev/null
       if [[ $is_linux_c -eq 1 ]]; then
-        ok "编译: gcc -O3 -pthread -o \"$exe_path\" \"$path\""
+        ok "Compiling: gcc -O3 -pthread -o \"$exe_path\" \"$path\""
         if ! gcc -O3 -pthread -finput-charset=UTF-8 -o "$exe_path" "$path"; then
-          err "gcc 编译失败。"
+          err "gcc compilation failed."
           popd >/dev/null
           return 1
         fi
       else
-        ok "编译: gcc -O3 -o \"$exe_path\" \"$path\""
+        ok "Compiling: gcc -O3 -o \"$exe_path\" \"$path\""
         if ! gcc -O3 -finput-charset=UTF-8 -o "$exe_path" "$path"; then
-          err "gcc 编译失败。"
+          err "gcc compilation failed."
           popd >/dev/null
           return 1
         fi
       fi
-      ok "执行: $exe_path"
+      ok "Executing: $exe_path"
       "$exe_path"
       popd >/dev/null
       ;;
 
     *)
-      err "不支持的文件类型：.$ext"
+      err "Unsupported file type: .$ext"
       return 1
       ;;
   esac
 }
 
 # ============================================================
-# 新增：扫描 + 编号菜单
+# New: scan + numbered menu
 # ============================================================
 start_run_menu() {
   local root="$1"
@@ -183,14 +183,14 @@ start_run_menu() {
   local -a langs=()
   local -a exts=()
 
-  # 中文在前，英文在后
-  local dirs=("$root/DDOS/Chinese:中文" "$root/DDOS/English:英文")
+  # Chinese first, English second
+  local dirs=("$root/DDOS/Chinese:Chinese" "$root/DDOS/English:English")
 
   for entry in "${dirs[@]}"; do
     local dir="${entry%%:*}"
     local lang="${entry##*:}"
     [[ -d "$dir" ]] || continue
-    # 按文件名排序
+    # Sort by filename
     while IFS= read -r -d '' file; do
       names+=("$(basename "$file")")
       paths+=("$file")
@@ -200,24 +200,24 @@ start_run_menu() {
   done
 
   if [[ ${#names[@]} -eq 0 ]]; then
-    warn "在 $root/DDOS 下未找到可运行的 .py / .c / .java 文件。"
+    warn "No .py / .c / .java files found under $root/DDOS."
     return 1
   fi
 
   echo
-  echo -e "${GREEN}================ 选择要运行的文件 ================${NC}"
+  echo -e "${GREEN}================ Select a file to run ================${NC}"
   local i
   for i in "${!names[@]}"; do
     printf " %2d) %-32s (%s, .%s)\n" $((i + 1)) "${names[$i]}" "${langs[$i]}" "${exts[$i]}"
   done
-  echo "  0) 退出"
-  echo -e "${GREEN}====================================================${NC}"
+  echo "  0) Exit"
+  echo -e "${GREEN}======================================================${NC}"
 
   local choice
   while true; do
-    read -r -p "[?] 请输入编号: " choice
+    read -r -p "[?] Enter number: " choice
     if [[ "$choice" == "0" ]]; then
-      log "已退出。"
+      log "Exited."
       return 0
     fi
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
@@ -225,65 +225,64 @@ start_run_menu() {
       echo
       run_target_file "${paths[$idx]}" "${names[$idx]}" || true
       echo
-      ok "该文件已结束运行。"
+      ok "File execution finished."
       return 0
     fi
-    err "无效输入，请输入 1-${#names[@]} 或 0 退出。"
+    err "Invalid input, enter 1-${#names[@]} or 0 to exit."
   done
 }
 
 # ============================================================
-# 阶段 1：检测
+# Stage 1: Detect
 # ============================================================
 detect_distro
 
-log "===== 阶段 1：检测已安装组件（不下载） ====="
+log "===== Stage 1: Detect installed components (no downloads) ====="
 MISSING=()
 NEED_EPEL=0
 
 if c_ready; then
-  ok "C 工具链已存在（gcc, make），跳过。"
+  ok "C toolchain already present (gcc, make), skipping."
 else
-  warn "C 工具链缺失：gcc=$(have_cmd gcc && echo Y || echo N)  make=$(have_cmd make && echo Y || echo N)"
+  warn "C toolchain missing: gcc=$(have_cmd gcc && echo Y || echo N)  make=$(have_cmd make && echo Y || echo N)"
   MISSING+=("c_toolchain")
 fi
 
 if java_ready; then
-  ok "Java 已存在：$(java -version 2>&1 | head -1)，跳过。"
+  ok "Java already present: $(java -version 2>&1 | head -1), skipping."
 else
-  warn "Java 缺失（java/javac 不完整）。"
+  warn "Java missing (java/javac incomplete)."
   MISSING+=("java")
 fi
 
 if python_ready; then
-  ok "Python 已存在：$(python3 --version 2>&1)，pip3=$(pip3 --version 2>&1 | cut -d' ' -f1-2)，跳过。"
+  ok "Python already present: $(python3 --version 2>&1), pip3=$(pip3 --version 2>&1 | cut -d' ' -f1-2), skipping."
 else
-  warn "Python 缺失（python3/pip3 不完整）。"
+  warn "Python missing (python3/pip3 incomplete)."
   MISSING+=("python")
 fi
 
 if figlet_ready; then
-  ok "figlet 已存在，跳过。"
+  ok "figlet already present, skipping."
 else
-  warn "figlet 缺失。"
+  warn "figlet missing."
   MISSING+=("figlet")
   [[ "$PKG_FAMILY" == "rhel" ]] && NEED_EPEL=1
 fi
 
 # ------------------------------------------------------------
-# 情况 A：全部齐全 → 直接进入运行菜单
+# Case A: everything present -> go straight to run menu
 # ------------------------------------------------------------
 if [[ ${#MISSING[@]} -eq 0 ]]; then
   echo
-  ok "所有目标组件均已安装，无需下载任何内容。"
+  ok "All target components already installed. Nothing to download."
   echo
   figlet -f small "All Ready" 2>/dev/null || echo "All Ready"
 
-  # 刷新 bash 的 command hash（不必须，但保险）
+  # Refresh bash command hash
   hash -r 2>/dev/null || true
 
   START_DIR="$(pwd)"
-  # 如果脚本是通过绝对路径调用的，优先用脚本所在目录
   if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [[ -d "$SCRIPT_DIR/DDOS" ]]; then
@@ -292,26 +291,26 @@ if [[ ${#MISSING[@]} -eq 0 ]]; then
   fi
 
   echo
-  log "===== 阶段 3：选择要运行的文件 ====="
+  log "===== Stage 3: Select a file to run ====="
 
   if PROJECT_ROOT="$(resolve_project_root "$START_DIR")"; then
-    ok "项目根目录：$PROJECT_ROOT"
+    ok "Project root: $PROJECT_ROOT"
     start_run_menu "$PROJECT_ROOT"
   else
-    warn "未找到 DDOS 子目录，跳过运行菜单。"
-    log "请将本脚本放在 DDOS-Attack 项目根目录（含 DDOS/）后重试，或先 cd 到项目根目录。"
+    warn "DDOS subdirectory not found, skipping run menu."
+    log "Place this script in the DDOS-Attack project root (the one containing DDOS/) and retry, or cd to the project root first."
   fi
   exit 0
 fi
 
 # ============================================================
-# 阶段 2：安装
+# Stage 2: Install
 # ============================================================
-log "待安装项：${MISSING[*]}"
-log "===== 阶段 2：安装缺失组件 ====="
+log "Missing items: ${MISSING[*]}"
+log "===== Stage 2: Install missing components ====="
 
 pkg_update() {
-  log "更新包索引..."
+  log "Updating package index..."
   if [[ "$PKG_FAMILY" == "debian" ]]; then
     apt-get update -qq
   else
@@ -321,7 +320,7 @@ pkg_update() {
 
 pkg_install() {
   local pkgs=("$@")
-  log "安装: ${pkgs[*]}"
+  log "Installing: ${pkgs[*]}"
   if [[ "$PKG_FAMILY" == "debian" ]]; then
     apt-get install -y -qq "${pkgs[@]}"
   else
@@ -373,28 +372,28 @@ for item in "${MISSING[@]}"; do
 done
 
 # ============================================================
-# 安装汇总
+# Installation summary
 # ============================================================
 echo
-echo -e "${GREEN}================ 安装汇总 ================${NC}"
-printf "  %-12s : %s\n" "gcc"    "$(gcc --version 2>/dev/null | head -1 || echo '未安装')"
-printf "  %-12s : %s\n" "make"   "$(make --version 2>/dev/null | head -1 || echo '未安装')"
-printf "  %-12s : %s\n" "java"   "$(java -version 2>&1 | head -1 || echo '未安装')"
-printf "  %-12s : %s\n" "javac"  "$(javac -version 2>&1 || echo '未安装')"
-printf "  %-12s : %s\n" "python3" "$(python3 --version 2>&1 || echo '未安装')"
-printf "  %-12s : %s\n" "pip3"   "$(pip3 --version 2>&1 | cut -d' ' -f1-2 || echo '未安装')"
-printf "  %-12s : %s\n" "figlet" "$(figlet -v 2>&1 | head -1 || echo '未安装')"
-echo -e "${GREEN}=========================================${NC}"
+echo -e "${GREEN}================ Install summary ================${NC}"
+printf "  %-12s : %s\n" "gcc"    "$(gcc --version 2>/dev/null | head -1 || echo 'not installed')"
+printf "  %-12s : %s\n" "make"   "$(make --version 2>/dev/null | head -1 || echo 'not installed')"
+printf "  %-12s : %s\n" "java"   "$(java -version 2>&1 | head -1 || echo 'not installed')"
+printf "  %-12s : %s\n" "javac"  "$(javac -version 2>&1 || echo 'not installed')"
+printf "  %-12s : %s\n" "python3" "$(python3 --version 2>&1 || echo 'not installed')"
+printf "  %-12s : %s\n" "pip3"   "$(pip3 --version 2>&1 | cut -d' ' -f1-2 || echo 'not installed')"
+printf "  %-12s : %s\n" "figlet" "$(figlet -v 2>&1 | head -1 || echo 'not installed')"
+echo -e "${GREEN}=================================================${NC}"
 echo
-figlet -f small "Done" 2>/dev/null || echo "全部完成。"
+figlet -f small "Done" 2>/dev/null || echo "All done."
 
 # ============================================================
-# 阶段 3：选择要运行的文件
+# Stage 3: Select a file to run
 # ============================================================
 echo
-log "===== 阶段 3：选择要运行的文件 ====="
+log "===== Stage 3: Select a file to run ====="
 
-# 刷新 command hash
+# Refresh command hash
 hash -r 2>/dev/null || true
 
 START_DIR="$(pwd)"
@@ -406,11 +405,11 @@ if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
 fi
 
 if PROJECT_ROOT="$(resolve_project_root "$START_DIR")"; then
-  ok "项目根目录：$PROJECT_ROOT"
+  ok "Project root: $PROJECT_ROOT"
   start_run_menu "$PROJECT_ROOT"
 else
-  warn "未在当前目录或脚本目录中找到 DDOS 子目录。"
-  log "请将本脚本放在 DDOS-Attack 项目根目录（含 DDOS/）后重新运行。"
-  log "或手动 cd 到项目根目录后再执行。"
+  warn "DDOS subdirectory not found in current or script directory."
+  log "Place this script in the DDOS-Attack project root (the one containing DDOS/) and re-run."
+  log "Or cd to the project root manually and run again."
   exit 0
 fi
