@@ -6,18 +6,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.LongAdder;
 
-/**
- * High-performance UDP/TCP flood tool (Java)
- * For authorized isolated lab environments only.
- *
- * Java's hard limits (cannot be fixed in pure Java):
- *   - No raw socket / no true source-IP spoofing.
- *   - TCP mode uses full 3-way handshake (not SYN flood).
- *
- * Tuning hint for Linux targets:
- *   sysctl -w net.core.wmem_max=8388608 net.core.rmem_max=8388608
- *   ulimit -n 65535
- */
 public class DDOSAttack {
 
     // ---------- Shared statistics ----------
