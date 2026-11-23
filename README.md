@@ -88,8 +88,8 @@ DDOS-Attack/
 ├── Art/
 │   ├── Figlet_DDOS-Attack           → figlet font preview (DDOS-Attack)
 │   └── Figlet_AttackStarting        → figlet font preview (Attack Starting)
-├── README.md                        → Chinese introduction
-├── README-English.md                → English introduction
+├── README-Chinese.md                → Chinese introduction
+├── README.md                        → English introduction
 └── LICENSE                          → Open source license (GPLv3)
 ```
 
