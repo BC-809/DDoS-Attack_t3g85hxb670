@@ -89,6 +89,7 @@ DDOS-Attack/
 │   ├── Figlet_DDOS-Attack           → figlet font preview (DDOS-Attack)
 │   └── Figlet_AttackStarting        → figlet font preview (Attack Starting)
 ├── README.md                        → Chinese introduction
+├── README-English.md                → English introduction
 └── LICENSE                          → Open source license (GPLv3)
 ```
 
