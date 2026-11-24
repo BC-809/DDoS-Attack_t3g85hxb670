@@ -1,5 +1,5 @@
 # DDoS-Attack 分布式拒绝服务攻击模拟工具
-# [英文](README.md)
+# [English](README.md)
 
 ## 严格的法律与道德警告
 
