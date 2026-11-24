@@ -1,5 +1,5 @@
 # DDoS-Attack Distributed Denial of Service Attack Simulation Tool
-# [Chinese](README-Chinese.md)
+# [中文](README-Chinese.md)
 
 ## Strict Legal and Ethical Warning
 
